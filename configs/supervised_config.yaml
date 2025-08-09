@@ -1,0 +1,117 @@
+# 有监督联合训练配置
+model:
+  dataset_type: 'bnci2a'
+  n_channels: 22
+  n_samples: 1000
+  sfreq: 250.0
+  
+  # FilterBank配置
+  filter_bands: [[4, 8], [8, 14], [14, 30], [30, 45]]
+  use_adaptive_filterbank: false
+  
+  # 图卷积配置
+  use_graph_conv: true
+  graph_hidden_dims: [64, 128]
+  graph_output_dim: 128
+  
+  # S4分支配置
+  use_s4_branch: true
+  s4_d_model: 128
+  s4_d_state: 64
+  s4_n_layers: 2
+  
+  # Mamba分支配置
+  use_mamba_branch: true
+  mamba_d_model: 128
+  mamba_d_state: 16
+  mamba_n_layers: 2
+  
+  # 融合配置
+  fusion_method: 'cross_attention'
+  fusion_n_heads: 8
+  
+  # MoE配置
+  use_moe: true
+  moe_n_experts: 4
+  moe_top_k: 2
+  
+  # 多任务配置
+  task_configs:
+    bnci2a:
+      d_output: 4
+      top_k: 2
+    bnci2b:
+      d_output: 2
+      top_k: 2
+    eegmmi:
+      d_output: 4
+      top_k: 2
+  
+  # 通用配置
+  dropout: 0.1
+
+training:
+  # 优化器配置
+  learning_rate: 1e-3
+  weight_decay: 1e-4
+  
+  # 训练配置
+  batch_size: 32
+  max_epochs: 200
+  early_stopping_patience: 20
+  
+  # 调度器配置
+  scheduler_type: 'cosine'  # 'cosine', 'step', 'plateau'
+  
+  # 损失配置
+  label_smoothing: 0.1
+  
+  # 任务权重
+  task_weights:
+    bnci2a: 1.0
+    bnci2b: 1.5  # 更小的数据集给更高权重
+    eegmmi: 1.0
+
+augmentation:
+  enabled: true
+  augment_prob: 0.3
+  augmentation_ratio: 0.2
+  
+  # 增广配置
+  transforms_config:
+    time_reverse:
+      enabled: true
+      probability: 0.3
+    sign_flip:
+      enabled: true
+      probability: 0.3
+    ft_surrogate:
+      enabled: true
+      probability: 0.2
+      phase_noise_magnitude: 1.0
+    smooth_time_mask:
+      enabled: true
+      probability: 0.3
+      mask_len_samples: 50
+      n_masks: 2
+    frequency_shift:
+      enabled: true
+      probability: 0.2
+      max_delta_freq: 2.0
+    channels_shuffle:
+      enabled: true
+      probability: 0.2
+      n_channels: 3
+    channels_dropout:
+      enabled: true
+      probability: 0.2
+      n_channels: 2
+    gaussian_noise:
+      enabled: true
+      probability: 0.3
+      std: 0.01
+    mixup:
+      enabled: true
+      probability: 0.3
+      alpha: 0.2
+
