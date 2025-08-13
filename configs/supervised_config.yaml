@@ -10,7 +10,7 @@ model:
   use_adaptive_filterbank: false
   
   # 图卷积配置
-  use_graph_conv: true
+  use_graph_conv: true  # 启用图卷积（PyG已安装）
   graph_hidden_dims: [64, 128]
   graph_output_dim: 128
   
@@ -21,7 +21,7 @@ model:
   s4_n_layers: 2
   
   # Mamba分支配置
-  use_mamba_branch: true
+  use_mamba_branch: false  # 禁用Mamba（mamba-ssm不可用）
   mamba_d_model: 128
   mamba_d_state: 16
   mamba_n_layers: 2
@@ -56,9 +56,9 @@ training:
   weight_decay: 1e-4
   
   # 训练配置
-  batch_size: 32
-  max_epochs: 200
-  early_stopping_patience: 20
+  batch_size: 16  # 减小batch_size
+  max_epochs: 3    # 减少epoch数用于快速测试  
+  early_stopping_patience: 5
   
   # 调度器配置
   scheduler_type: 'cosine'  # 'cosine', 'step', 'plateau'

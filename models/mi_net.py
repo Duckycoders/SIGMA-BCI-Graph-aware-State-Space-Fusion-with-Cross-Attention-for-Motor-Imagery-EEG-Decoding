@@ -328,7 +328,7 @@ class MINet(nn.Module):
             # 我们对每个时间点进行一次图卷积：节点为电极，特征为该时刻该频带的幅值（标量）
             # 将数据重排为 (batch*n_bands, n_samples, n_channels)
             x = x.permute(0, 1, 3, 2).contiguous()  # (batch, n_bands, n_samples, n_channels)
-            x = x.view(batch_size * n_bands, n_samples, n_channels)
+            x = x.contiguous().view(batch_size * n_bands, n_samples, n_channels)
 
             # 逐时间步送入图网络，得到每个时间点的图级特征（全局池化后维度为 graph_output_dim）
             graph_features = []

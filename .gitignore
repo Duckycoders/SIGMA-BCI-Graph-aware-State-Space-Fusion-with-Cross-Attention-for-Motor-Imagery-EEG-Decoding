@@ -56,6 +56,14 @@ Thumbs.db
 # Logs
 *.log
 
+# Colab specific
+.config/
+sample_data/
+
+# Large model files (uncomment if using Git LFS)
+# *.pth
+# *.npz
+
 # Model checkpoints (keeping structure but not the actual model files)
 checkpoints/**/
 !checkpoints/

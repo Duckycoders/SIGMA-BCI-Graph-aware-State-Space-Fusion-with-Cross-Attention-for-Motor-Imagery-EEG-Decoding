@@ -66,11 +66,18 @@ class MaskedEEGDataset(Dataset):
         masked_length = 0
         while masked_length < total_mask_length:
             # 随机选择遮罩块长度
-            block_length = random.randint(self.min_mask_length, 
-                                        min(self.max_mask_length, total_mask_length - masked_length))
+            remaining_length = total_mask_length - masked_length
+            max_block_length = min(self.max_mask_length, remaining_length, n_samples)
+            if max_block_length < self.min_mask_length:
+                break
+            block_length = random.randint(self.min_mask_length, max_block_length)
             
             # 随机选择起始位置
-            start_pos = random.randint(0, n_samples - block_length)
+            if block_length >= n_samples:
+                start_pos = 0
+                block_length = n_samples
+            else:
+                start_pos = random.randint(0, n_samples - block_length)
             
             # 应用遮罩
             mask[start_pos:start_pos + block_length] = False
@@ -482,7 +489,7 @@ def main():
     
     # 加载配置
     if os.path.exists(args.config):
-        with open(args.config, 'r') as f:
+        with open(args.config, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
     else:
         # 默认配置
@@ -528,35 +535,40 @@ def main():
     ssl_config = config['ssl']
     train_dataset = MaskedEEGDataset(
         train_data,
-        mask_ratio=ssl_config['mask_ratio'],
+        mask_ratio=float(ssl_config['mask_ratio']),
         mask_type=ssl_config['mask_type'],
-        min_mask_length=ssl_config['min_mask_length'],
-        max_mask_length=ssl_config['max_mask_length']
+        min_mask_length=int(ssl_config['min_mask_length']),
+        max_mask_length=int(ssl_config['max_mask_length'])
     )
     
     val_dataset = MaskedEEGDataset(
         val_data,
-        mask_ratio=ssl_config['mask_ratio'],
+        mask_ratio=float(ssl_config['mask_ratio']),
         mask_type=ssl_config['mask_type'],
-        min_mask_length=ssl_config['min_mask_length'],
-        max_mask_length=ssl_config['max_mask_length']
+        min_mask_length=int(ssl_config['min_mask_length']),
+        max_mask_length=int(ssl_config['max_mask_length'])
     )
+    
+    # CPU环境下DataLoader更安全设置
+    is_cpu = (args.device == 'cpu')
+    num_workers = 0 if is_cpu else 4
+    pin_memory = False if is_cpu else True
     
     # 创建数据加载器
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=ssl_config['batch_size'],
+        batch_size=int(ssl_config['batch_size']),
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        num_workers=num_workers,
+        pin_memory=pin_memory
     )
     
     val_dataloader = DataLoader(
         val_dataset,
-        batch_size=ssl_config['batch_size'],
+        batch_size=int(ssl_config['batch_size']),
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=num_workers,
+        pin_memory=pin_memory
     )
     
     # 创建模型
@@ -568,10 +580,10 @@ def main():
     pretrainer = SSLPretrainer(
         model=model,
         device=args.device,
-        learning_rate=ssl_config['learning_rate'],
-        weight_decay=ssl_config['weight_decay'],
-        warmup_epochs=ssl_config['warmup_epochs'],
-        max_epochs=ssl_config['max_epochs']
+        learning_rate=float(ssl_config['learning_rate']),
+        weight_decay=float(ssl_config['weight_decay']),
+        warmup_epochs=int(ssl_config['warmup_epochs']),
+        max_epochs=int(ssl_config['max_epochs'])
     )
     
     # 开始预训练

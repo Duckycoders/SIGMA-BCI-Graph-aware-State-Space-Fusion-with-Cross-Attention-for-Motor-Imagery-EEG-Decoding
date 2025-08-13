@@ -329,7 +329,7 @@ def main():
     
     # 加载模型
     print("加载模型...")
-    checkpoint = torch.load(args.model_path, map_location='cpu')
+    checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
     
     # 根据数据推断模型配置
     data = load_evaluation_data(args.data_path)
@@ -337,9 +337,13 @@ def main():
     n_samples = data['trials'].shape[2]
     n_classes = len(np.unique(data['labels']))
     
+    # 使用与训练时相同的配置
     model = create_mi_net(
+        dataset_type='bnci2a',  # 使用标准配置
         n_channels=n_channels,
         n_samples=n_samples,
+        use_graph_conv=False,   # 禁用图卷积
+        use_mamba_branch=False, # 禁用Mamba
         task_configs={args.task_name: {'d_output': n_classes, 'top_k': 2}}
     )
     
