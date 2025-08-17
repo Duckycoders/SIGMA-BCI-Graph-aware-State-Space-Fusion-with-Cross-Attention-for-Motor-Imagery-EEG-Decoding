@@ -1,0 +1,87 @@
+# MI-Net基础模型配置
+name: mi_net_base
+
+# 数据配置
+n_channels: 22
+n_samples: 1000
+sfreq: 250.0
+
+# FilterBank配置
+filterbank:
+  enabled: true
+  type: fixed  # fixed, adaptive
+  filter_bands: [[4, 8], [8, 14], [14, 30], [30, 45]]
+  filter_type: conv1d
+  filter_order: 4
+
+# 图卷积配置
+graph_conv:
+  enabled: true
+  type: gcn  # gcn, gat
+  hidden_dims: [64, 128]
+  output_dim: 128
+  dropout: 0.1
+  use_global_pooling: true
+
+# S4分支配置
+s4_branch:
+  enabled: true
+  d_model: 128
+  d_state: 64
+  n_layers: 2
+  dropout: 0.1
+  activation: gelu
+  prenorm: true
+
+# Mamba分支配置
+mamba_branch:
+  enabled: true
+  d_model: 128
+  d_state: 16
+  n_layers: 2
+  d_conv: 4
+  expand: 2
+  dropout: 0.1
+  use_simple_fallback: false
+
+# 跨注意力融合配置
+cross_attention:
+  enabled: true
+  fusion_method: bidirectional  # bidirectional, unidirectional, alternating
+  n_heads: 8
+  dropout: 0.1
+  temperature: 1.0
+
+# 多尺度融合配置
+multiscale_fusion:
+  enabled: true
+  fusion_type: attention  # attention, weighted_sum, conv
+  dropout: 0.1
+
+# MoE配置
+moe:
+  enabled: true
+  n_experts: 4
+  top_k: 2
+  expert_hidden_dim: null  # 自动设置为max(d_input, d_output) * 2
+  dropout: 0.1
+  load_balance_weight: 0.01
+  noisy_gating: true
+
+# 多任务配置
+task_configs:
+  motor_imagery:
+    d_output: 4
+    top_k: 2
+
+# 通用配置
+dropout: 0.1
+
+# 模块开关（消融实验用）
+module_switches:
+  filterbank: true
+  graph_conv: true
+  s4_branch: true
+  mamba_branch: true
+  fusion: true
+  moe: true

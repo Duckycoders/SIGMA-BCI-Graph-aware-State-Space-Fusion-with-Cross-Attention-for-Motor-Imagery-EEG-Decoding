@@ -9,20 +9,20 @@ model:
   filter_bands: [[4, 8], [8, 14], [14, 30], [30, 45]]
   use_adaptive_filterbank: false
   
-  # 图卷积配置 - 简化维度
-  use_graph_conv: true  # 启用图卷积（PyG已安装）
-  graph_hidden_dims: [32, 64]  # 减少维度
-  graph_output_dim: 64         # 减少输出维度
+  # 图卷积配置 - 启用并优化
+  use_graph_conv: true  # 启用图卷积
+  graph_hidden_dims: [32, 64]  # 适中维度
+  graph_output_dim: 64         # 输出维度
   
   # S4分支配置 - 简化模型维度
   use_s4_branch: true
-  s4_d_model: 64   # 减少从128到64
-  s4_d_state: 32   # 减少从64到32
+  s4_d_model: 64   # 优化维度
+  s4_d_state: 32   # 优化状态维度
   s4_n_layers: 2
   
-  # Mamba分支配置
-  use_mamba_branch: true  # 在Colab上启用Mamba
-  mamba_d_model: 64  # 减少从128到64
+  # Mamba分支配置 - 启用并优化
+  use_mamba_branch: true  # 启用Mamba
+  mamba_d_model: 64  # 优化维度
   mamba_d_state: 16
   mamba_n_layers: 2
   
@@ -55,8 +55,8 @@ training:
   learning_rate: 5e-4      # 降低学习率从1e-3到5e-4
   weight_decay: 1e-3       # 增加weight_decay从1e-4到1e-3
   
-  # 训练配置
-  batch_size: 16           # 保持较小batch_size
+  # 训练配置 - RTX 3060 Laptop优化
+  batch_size: 8            # 笔记本GPU较小batch_size
   max_epochs: 30           # 增加epoch数但使用早停
   early_stopping_patience: 8  # 增加早停patience
   
@@ -75,6 +75,7 @@ training:
     bnci2a: 1.0
     bnci2b: 1.5  # 更小的数据集给更高权重
     eegmmi: 1.0
+    default: 1.0  # 默认任务权重
 
 augmentation:
   enabled: true

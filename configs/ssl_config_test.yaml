@@ -1,0 +1,65 @@
+# 自监督预训练测试配置
+model:
+  dataset_type: 'bnci2a'
+  n_channels: 22
+  n_samples: 1000  # 使用测试数据长度
+  sfreq: 250.0
+  
+  # FilterBank配置
+  filter_bands: [[4, 8], [8, 14], [14, 30], [30, 45]]
+  use_adaptive_filterbank: false
+  
+  # 图卷积配置 - 启用并优化
+  use_graph_conv: true  # 启用图卷积
+  graph_hidden_dims: [32, 64]  # 适中维度
+  graph_output_dim: 64         # 输出维度
+  
+  # S4分支配置 - 简化模型维度
+  use_s4_branch: true
+  s4_d_model: 64   # 减少从128到64
+  s4_d_state: 32   # 减少从64到32
+  s4_n_layers: 2
+  
+  # Mamba分支配置 - 禁用以避免依赖问题
+  use_mamba_branch: false  # 禁用Mamba
+  
+  # 融合配置 - 减少attention头数
+  fusion_method: 'cross_attention'
+  fusion_n_heads: 4  # 减少从8到4
+  
+  # MoE配置 - 简化以减少过拟合
+  use_moe: true
+  moe_n_experts: 2  # 减少专家数量从4到2
+  moe_top_k: 1      # 减少top_k从2到1
+  
+  # 任务配置
+  task_configs:
+    default:
+      d_output: 4
+      top_k: 1
+  
+  # 通用配置 - 增加正则化
+  dropout: 0.2  # 增加dropout从0.1到0.2
+
+ssl:
+  # 遮罩配置
+  mask_ratio: 0.3
+  mask_type: 'time_block'  # 'time_block', 'channel_time', 'random'
+  min_mask_length: 5
+  max_mask_length: 50
+  
+  # 训练配置 - 快速测试
+  learning_rate: 5e-4      # 降低学习率从1e-3到5e-4
+  weight_decay: 1e-3       # 增加weight_decay从1e-4到1e-3
+  batch_size: 8            # 小batch_size
+  max_epochs: 3            # 仅3个epoch用于测试
+  warmup_epochs: 1         # 1个warmup epoch
+  
+  # 正则化配置
+  gradient_clip_val: 1.0   # 添加梯度裁剪
+  early_stopping_patience: 3  # 早停patience
+  early_stopping_min_delta: 0.001  # 早停最小改进
+  
+  # 调度器配置
+  scheduler_type: 'cosine'
+  min_lr_factor: 0.01

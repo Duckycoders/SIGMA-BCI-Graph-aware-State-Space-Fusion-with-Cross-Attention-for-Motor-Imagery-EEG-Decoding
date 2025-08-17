@@ -1,0 +1,32 @@
+# Hydra配置管理系统
+defaults:
+  - model: mi_net_base
+  - data: bnci2a
+  - training: supervised
+  - evaluation: loso
+  - _self_
+
+# 全局配置
+project_name: MI-Net
+experiment_name: ${model.name}_${data.dataset}_${now:%Y-%m-%d_%H-%M-%S}
+seed: 42
+device: cuda
+
+# 输出目录
+output_dir: ./outputs/${experiment_name}
+checkpoint_dir: ${output_dir}/checkpoints
+log_dir: ${output_dir}/logs
+results_dir: ${output_dir}/results
+
+# 日志配置
+logging:
+  level: INFO
+  use_wandb: true
+  wandb_project: MI-Net-Experiments
+  save_frequency: 10
+
+# 可复现性
+reproducibility:
+  deterministic: true
+  benchmark: false
+  use_amp: false

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-下载BCI Competition IV Dataset 2a和2b
+下载BCI Competition IV Dataset 2a/2b和EEG-MMI数据集
 使用MOABB库进行数据获取
 """
 
@@ -8,7 +8,7 @@ import os
 import argparse
 from pathlib import Path
 import numpy as np
-from moabb.datasets import BNCI2014_001, BNCI2014_004
+from moabb.datasets import BNCI2014_001, BNCI2014_004, PhysionetMI
 import mne
 
 
@@ -158,6 +158,80 @@ def download_bnci_2b(data_dir: str, subjects: list = None):
         f.write(f"已下载受试者: {subjects}\n")
 
 
+def download_eegmmi(data_dir: str, subjects: list = None):
+    """
+    下载EEG-MMI (PhysionetMI)数据集
+    
+    Args:
+        data_dir: 数据保存目录
+        subjects: 受试者列表，默认为[1, 2, 3, 4, 5]
+    """
+    if subjects is None:
+        subjects = [1, 2, 3, 4, 5]  # 默认下载前5个受试者
+    
+    data_dir = Path(data_dir) / "physionet_mi"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"下载EEG-MMI (PhysionetMI)数据集到: {data_dir}")
+    print(f"受试者: {subjects}")
+    
+    dataset = PhysionetMI()
+    
+    for subject in subjects:
+        print(f"\n下载受试者 {subject:03d}...")
+        
+        try:
+            # 获取受试者数据
+            subject_data = dataset.get_data(subjects=[subject])
+            
+            # 保存数据信息
+            for session_name, session_data in subject_data[subject].items():
+                print(f"  会话: {session_name}")
+                for run_name, raw in session_data.items():
+                    try:
+                        eeg_picks = mne.pick_types(raw.info, eeg=True, stim=False, eog=False, ecg=False, emg=False, misc=False)
+                        data = raw.get_data(picks=eeg_picks)
+                        ch_names = np.array([raw.ch_names[i] for i in eeg_picks], dtype=object)
+                        data_shape = data.shape
+                    except Exception:
+                        data = raw.get_data(picks='eeg')
+                        ch_names = np.array([ch for ch, t in zip(raw.ch_names, raw.get_channel_types()) if t == 'eeg'], dtype=object)
+                        data_shape = data.shape
+                    print(f"    Run: {run_name}, 形状: {data_shape}")
+                    
+                    # 提取events
+                    try:
+                        events, _ = mne.events_from_annotations(raw)
+                    except Exception:
+                        events = mne.find_events(raw, verbose=False)
+                    
+                    # 保存为numpy格式
+                    save_path = data_dir / f"S{subject:03d}_{session_name}_{run_name}.npz"
+                    np.savez(save_path,
+                            data=data,
+                            events=events,
+                            ch_names=ch_names,
+                            sfreq=float(raw.info['sfreq']))
+                    print(f"    保存到: {save_path}")
+        
+        except Exception as e:
+            print(f"  下载受试者 {subject:03d} 失败: {e}")
+            continue
+    
+    # 创建数据集描述
+    info_file = data_dir / "dataset_info.txt"
+    with open(info_file, 'w', encoding='utf-8') as f:
+        f.write("EEG-MMI (PhysionetMI) Dataset\n")
+        f.write("=" * 50 + "\n\n")
+        f.write("任务: 4类运动想象 (左拳、右拳、双拳、双脚)\n")
+        f.write("采样率: 160 Hz\n")
+        f.write("通道数: 64 (EEG)\n")
+        f.write("受试者数: 109\n")
+        f.write("会话数: 多个\n")
+        f.write("任务类型: 运动想象和运动执行\n\n")
+        f.write(f"已下载受试者: {subjects}\n")
+
+
 def check_bnci_data(data_dir: str):
     """检查下载的BNCI数据"""
     data_dir = Path(data_dir)
@@ -181,7 +255,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="下载BNCI数据集")
     parser.add_argument("--data_dir", type=str, default="data/bnci",
                        help="数据保存目录")
-    parser.add_argument("--dataset", type=str, choices=["2a", "2b", "both"], 
+    parser.add_argument("--dataset", type=str, choices=["2a", "2b", "eegmmi", "both", "all"], 
                        default="both", help="要下载的数据集")
     parser.add_argument("--subjects", type=int, nargs="+", default=[1, 2],
                        help="要下载的受试者列表")
@@ -193,10 +267,13 @@ if __name__ == "__main__":
     if args.check:
         check_bnci_data(args.data_dir)
     else:
-        if args.dataset in ["2a", "both"]:
+        if args.dataset in ["2a", "both", "all"]:
             download_bnci_2a(args.data_dir, args.subjects)
         
-        if args.dataset in ["2b", "both"]:
+        if args.dataset in ["2b", "both", "all"]:
             download_bnci_2b(args.data_dir, args.subjects)
+            
+        if args.dataset in ["eegmmi", "all"]:
+            download_eegmmi(args.data_dir, args.subjects)
             
         check_bnci_data(args.data_dir)
