@@ -29,15 +29,57 @@ from models.mi_net import create_mi_net
 from eeg.preprocess import EEGPreprocessor
 
 
+class SimpleEEGAugmentation:
+    """简化的EEG数据增强器，专为SSL设计"""
+    
+    def __init__(self, aug_prob=0.6, noise_std=0.02, time_shift_ratio=0.1):
+        self.aug_prob = aug_prob
+        self.noise_std = noise_std
+        self.time_shift_ratio = time_shift_ratio
+    
+    def apply_augmentation(self, x):
+        """应用简单的增强策略"""
+        if random.random() > self.aug_prob:
+            return x
+            
+        x_aug = x.clone()
+        
+        # 高斯噪声
+        if random.random() < 0.4:
+            noise = torch.randn_like(x_aug) * self.noise_std * x_aug.std()
+            x_aug = x_aug + noise
+        
+        # 时间偏移
+        if random.random() < 0.3:
+            n_samples = x_aug.shape[-1]
+            shift_range = int(self.time_shift_ratio * n_samples)
+            shift = random.randint(-shift_range, shift_range)
+            if shift != 0:
+                shifted = torch.zeros_like(x_aug)
+                if shift > 0:
+                    shifted[:, shift:] = x_aug[:, :-shift]
+                else:
+                    shifted[:, :shift] = x_aug[:, -shift:]
+                x_aug = shifted
+        
+        # 幅度缩放
+        if random.random() < 0.3:
+            scale = random.uniform(0.8, 1.2)
+            x_aug = x_aug * scale
+            
+        return x_aug
+
+
 class MaskedEEGDataset(Dataset):
-    """遮罩EEG数据集"""
+    """遮罩EEG数据集，集成SSL增强策略"""
     
     def __init__(self, 
                  data: np.ndarray,
                  mask_ratio: float = 0.5,
                  mask_type: str = 'time_block',
                  min_mask_length: int = 10,
-                 max_mask_length: int = 50):
+                 max_mask_length: int = 50,
+                 use_ssl_augmentation: bool = True):
         """
         初始化遮罩数据集
         
@@ -47,14 +89,20 @@ class MaskedEEGDataset(Dataset):
             mask_type: 遮罩类型 ('time_block', 'channel_time', 'random')
             min_mask_length: 最小遮罩长度
             max_mask_length: 最大遮罩长度
+            use_ssl_augmentation: 是否使用SSL增强
         """
         self.data = torch.FloatTensor(data)
         self.mask_ratio = mask_ratio
         self.mask_type = mask_type
         self.min_mask_length = min_mask_length
         self.max_mask_length = max_mask_length
+        self.use_ssl_augmentation = use_ssl_augmentation
         
         self.n_trials, self.n_channels, self.n_samples = data.shape
+        
+        # 初始化简单的SSL增强器
+        if self.use_ssl_augmentation:
+            self.ssl_augmenter = SimpleEEGAugmentation(aug_prob=0.6)
         
     def _create_time_block_mask(self, n_samples: int) -> torch.Tensor:
         """创建时间块遮罩"""
@@ -130,6 +178,10 @@ class MaskedEEGDataset(Dataset):
     def __getitem__(self, idx):
         trial = self.data[idx]  # (n_channels, n_samples)
         
+        # 应用SSL增强（在遮罩之前）
+        if self.use_ssl_augmentation:
+            trial = self.ssl_augmenter.apply_augmentation(trial)
+        
         # 创建遮罩
         if self.mask_type == 'time_block':
             mask = self._create_time_block_mask(self.n_samples)
@@ -161,7 +213,10 @@ class SSLPretrainer:
                  learning_rate: float = 1e-3,
                  weight_decay: float = 1e-4,
                  warmup_epochs: int = 10,
-                 max_epochs: int = 100):
+                 max_epochs: int = 100,
+                 gradient_clip_val: float = None,
+                 early_stopping_patience: int = None,
+                 early_stopping_min_delta: float = 0.001):
         """
         初始化预训练器
         
@@ -172,10 +227,21 @@ class SSLPretrainer:
             weight_decay: 权重衰减
             warmup_epochs: 预热轮数
             max_epochs: 最大轮数
+            gradient_clip_val: 梯度裁剪值
+            early_stopping_patience: 早停patience
+            early_stopping_min_delta: 早停最小改进
         """
         self.model = model.to(device)
         self.device = device
         self.max_epochs = max_epochs
+        self.gradient_clip_val = gradient_clip_val
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
+        
+        # 早停相关
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        self.best_model_state = None
         
         # 优化器
         self.optimizer = AdamW(
@@ -321,7 +387,8 @@ class SSLPretrainer:
             losses['total_loss'].backward()
             
             # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if self.gradient_clip_val is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clip_val)
             
             self.optimizer.step()
             
@@ -379,8 +446,6 @@ class SSLPretrainer:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         
-        best_val_loss = float('inf')
-        
         for epoch in range(self.max_epochs):
             print(f"\nEpoch {epoch + 1}/{self.max_epochs}")
             
@@ -393,13 +458,13 @@ class SSLPretrainer:
                 val_losses = self.validate_epoch(val_dataloader)
                 self.val_losses.append(val_losses)
                 
-                # 打印损失
-                print(f"Train Loss: {train_losses['total_loss']:.6f}, "
-                      f"Val Loss: {val_losses['total_loss']:.6f}")
-                
-                # 保存最佳模型
-                if val_losses['total_loss'] < best_val_loss:
-                    best_val_loss = val_losses['total_loss']
+                # 早停检查
+                current_val_loss = val_losses['total_loss']
+                if current_val_loss < self.best_val_loss - self.early_stopping_min_delta:
+                    self.best_val_loss = current_val_loss
+                    self.patience_counter = 0
+                    # 保存最佳模型
+                    self.best_model_state = self.model.state_dict().copy()
                     torch.save({
                         'epoch': epoch,
                         'model_state_dict': self.model.state_dict(),
@@ -407,8 +472,23 @@ class SSLPretrainer:
                         'scheduler_state_dict': self.scheduler.state_dict(),
                         'train_losses': self.train_losses,
                         'val_losses': self.val_losses,
-                        'best_val_loss': best_val_loss
+                        'best_val_loss': self.best_val_loss
                     }, save_dir / 'best_ssl_model.pth')
+                    print(f"Train Loss: {train_losses['total_loss']:.6f}, "
+                          f"Val Loss: {current_val_loss:.6f} (NEW BEST)")
+                else:
+                    self.patience_counter += 1
+                    print(f"Train Loss: {train_losses['total_loss']:.6f}, "
+                          f"Val Loss: {current_val_loss:.6f} (patience: {self.patience_counter}/{self.early_stopping_patience})")
+                
+                # 早停
+                if self.early_stopping_patience is not None and self.patience_counter >= self.early_stopping_patience:
+                    print(f"\n早停触发! 在epoch {epoch + 1}停止训练")
+                    print(f"最佳验证损失: {self.best_val_loss:.6f}")
+                    if self.best_model_state is not None:
+                        self.model.load_state_dict(self.best_model_state)
+                        print("已恢复最佳模型权重")
+                    break
             else:
                 print(f"Train Loss: {train_losses['total_loss']:.6f}")
             
@@ -538,7 +618,8 @@ def main():
         mask_ratio=float(ssl_config['mask_ratio']),
         mask_type=ssl_config['mask_type'],
         min_mask_length=int(ssl_config['min_mask_length']),
-        max_mask_length=int(ssl_config['max_mask_length'])
+        max_mask_length=int(ssl_config['max_mask_length']),
+        use_ssl_augmentation=True  # 训练集使用增强
     )
     
     val_dataset = MaskedEEGDataset(
@@ -546,7 +627,8 @@ def main():
         mask_ratio=float(ssl_config['mask_ratio']),
         mask_type=ssl_config['mask_type'],
         min_mask_length=int(ssl_config['min_mask_length']),
-        max_mask_length=int(ssl_config['max_mask_length'])
+        max_mask_length=int(ssl_config['max_mask_length']),
+        use_ssl_augmentation=False  # 验证集不使用增强
     )
     
     # CPU环境下DataLoader更安全设置
@@ -583,7 +665,10 @@ def main():
         learning_rate=float(ssl_config['learning_rate']),
         weight_decay=float(ssl_config['weight_decay']),
         warmup_epochs=int(ssl_config['warmup_epochs']),
-        max_epochs=int(ssl_config['max_epochs'])
+        max_epochs=int(ssl_config['max_epochs']),
+        gradient_clip_val=ssl_config.get('gradient_clip_val'),
+        early_stopping_patience=ssl_config.get('early_stopping_patience'),
+        early_stopping_min_delta=ssl_config.get('early_stopping_min_delta', 0.001)
     )
     
     # 开始预训练

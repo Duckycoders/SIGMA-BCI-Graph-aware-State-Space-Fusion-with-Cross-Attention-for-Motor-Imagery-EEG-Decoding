@@ -2,38 +2,38 @@
 model:
   dataset_type: 'bnci2a'
   n_channels: 22
-  n_samples: 1000
+  n_samples: 751  # 使用实际数据长度，避免长度不匹配
   sfreq: 250.0
   
   # FilterBank配置
   filter_bands: [[4, 8], [8, 14], [14, 30], [30, 45]]
   use_adaptive_filterbank: false
   
-  # 图卷积配置
+  # 图卷积配置 - 简化维度
   use_graph_conv: true  # 启用图卷积（PyG已安装）
-  graph_hidden_dims: [64, 128]
-  graph_output_dim: 128
+  graph_hidden_dims: [32, 64]  # 减少维度
+  graph_output_dim: 64         # 减少输出维度
   
-  # S4分支配置
+  # S4分支配置 - 简化模型维度
   use_s4_branch: true
-  s4_d_model: 128
-  s4_d_state: 64
+  s4_d_model: 64   # 减少从128到64
+  s4_d_state: 32   # 减少从64到32
   s4_n_layers: 2
   
   # Mamba分支配置
-  use_mamba_branch: false  # 禁用Mamba（mamba-ssm不可用）
-  mamba_d_model: 128
+  use_mamba_branch: true  # 在Colab上启用Mamba
+  mamba_d_model: 64  # 减少从128到64
   mamba_d_state: 16
   mamba_n_layers: 2
   
-  # 融合配置
+  # 融合配置 - 减少attention头数
   fusion_method: 'cross_attention'
-  fusion_n_heads: 8
+  fusion_n_heads: 4  # 减少从8到4
   
-  # MoE配置
+  # MoE配置 - 简化以减少过拟合
   use_moe: true
-  moe_n_experts: 4
-  moe_top_k: 2
+  moe_n_experts: 2  # 减少专家数量从4到2
+  moe_top_k: 1      # 减少top_k从2到1
   
   # 任务配置
   task_configs:
@@ -41,8 +41,8 @@ model:
       d_output: 4
       top_k: 2
   
-  # 通用配置
-  dropout: 0.1
+  # 通用配置 - 增加正则化
+  dropout: 0.2  # 增加dropout从0.1到0.2
 
 ssl:
   # 遮罩配置
@@ -51,12 +51,17 @@ ssl:
   min_mask_length: 5
   max_mask_length: 50
   
-  # 训练配置
-  learning_rate: 1e-3
-  weight_decay: 1e-4
-  batch_size: 16  # 减小batch_size以适应CPU/小内存
-  max_epochs: 3   # 减少epoch数用于快速测试
-  warmup_epochs: 1
+  # 训练配置 - 优化稳定性
+  learning_rate: 5e-4      # 降低学习率从1e-3到5e-4
+  weight_decay: 1e-3       # 增加weight_decay从1e-4到1e-3
+  batch_size: 16           # 保持较小batch_size
+  max_epochs: 50           # 增加epoch数但使用早停
+  warmup_epochs: 5         # 增加warmup
+  
+  # 正则化配置
+  gradient_clip_val: 1.0   # 添加梯度裁剪
+  early_stopping_patience: 5  # 早停patience
+  early_stopping_min_delta: 0.001  # 早停最小改进
   
   # 调度器配置
   scheduler_type: 'cosine'

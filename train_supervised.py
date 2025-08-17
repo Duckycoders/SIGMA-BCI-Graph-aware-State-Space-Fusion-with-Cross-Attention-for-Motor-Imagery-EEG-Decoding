@@ -29,7 +29,50 @@ logger = logging.getLogger(__name__)
 
 from models.mi_net import create_mi_net
 from eeg.preprocess import EEGPreprocessor
-from eeg.augment import create_augmentation_pipeline
+
+
+class SimpleEEGAugmentation:
+    """简化的EEG数据增强器，用于有监督训练"""
+    
+    def __init__(self, aug_prob=0.3):
+        self.aug_prob = aug_prob
+    
+    def apply_augmentation(self, trials, labels=None):
+        """应用简单的增强策略"""
+        if random.random() > self.aug_prob:
+            return trials, labels
+            
+        augmented_trials = []
+        augmented_labels = []
+        
+        for i in range(len(trials)):
+            trial = torch.FloatTensor(trials[i]) if not isinstance(trials[i], torch.Tensor) else trials[i]
+            
+            # 随机应用一种增强
+            aug_type = random.choice(['noise', 'scale', 'shift'])
+            
+            if aug_type == 'noise':
+                noise = torch.randn_like(trial) * 0.01 * trial.std()
+                trial = trial + noise
+            elif aug_type == 'scale':
+                scale = random.uniform(0.9, 1.1)
+                trial = trial * scale
+            elif aug_type == 'shift':
+                n_samples = trial.shape[-1]
+                shift = random.randint(-int(0.05*n_samples), int(0.05*n_samples))
+                if shift != 0:
+                    shifted = torch.zeros_like(trial)
+                    if shift > 0:
+                        shifted[:, shift:] = trial[:, :-shift]
+                    else:
+                        shifted[:, :shift] = trial[:, -shift:]
+                    trial = shifted
+            
+            augmented_trials.append(trial.numpy())
+            if labels is not None:
+                augmented_labels.append(labels[i])
+        
+        return np.array(augmented_trials), np.array(augmented_labels) if labels is not None else None
 
 
 class MultiTaskEEGDataset(Dataset):
@@ -94,7 +137,9 @@ class MultiTaskEEGDataset(Dataset):
         
         # 数据增广
         if self.augmentation_pipeline is not None and random.random() < self.augment_prob:
-            trial = self.augmentation_pipeline.apply_single_trial(trial)
+            trial_batch = np.array([trial])
+            aug_trials, _ = self.augmentation_pipeline.apply_augmentation(trial_batch)
+            trial = aug_trials[0]
         
         return {
             'trial': torch.FloatTensor(trial),
@@ -592,10 +637,10 @@ def main():
             'labels': labels[indices[train_size:]]
         }
     
-    # 创建增广管线
+    # 创建简化增广器
     augmentation_pipeline = None
     if config['augmentation']['enabled']:
-        augmentation_pipeline = create_augmentation_pipeline(mode='training', sfreq=config['model'].get('sfreq', 250.0))
+        augmentation_pipeline = SimpleEEGAugmentation(aug_prob=config['augmentation']['augment_prob'])
     
     # CPU环境下DataLoader更安全设置
     is_cpu = (args.device == 'cpu')
