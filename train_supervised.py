@@ -27,7 +27,7 @@ import seaborn as sns
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from models.mi_net import create_mi_net
+from models.mi_net import create_mi_net, mmd_loss
 from eeg.preprocess import EEGPreprocessor
 
 
@@ -48,25 +48,52 @@ class SimpleEEGAugmentation:
         for i in range(len(trials)):
             trial = torch.FloatTensor(trials[i]) if not isinstance(trials[i], torch.Tensor) else trials[i]
             
-            # 随机应用一种增强
-            aug_type = random.choice(['noise', 'scale', 'shift'])
+            # 随机应用一种或多种增强
+            aug_types = random.sample(['noise', 'scale', 'shift', 'channel_dropout', 'time_jitter'], 
+                                    k=random.randint(1, 2))
             
-            if aug_type == 'noise':
-                noise = torch.randn_like(trial) * 0.01 * trial.std()
-                trial = trial + noise
-            elif aug_type == 'scale':
-                scale = random.uniform(0.9, 1.1)
-                trial = trial * scale
-            elif aug_type == 'shift':
-                n_samples = trial.shape[-1]
-                shift = random.randint(-int(0.05*n_samples), int(0.05*n_samples))
-                if shift != 0:
-                    shifted = torch.zeros_like(trial)
-                    if shift > 0:
-                        shifted[:, shift:] = trial[:, :-shift]
-                    else:
-                        shifted[:, :shift] = trial[:, -shift:]
-                    trial = shifted
+            for aug_type in aug_types:
+                if aug_type == 'noise':
+                    # 添加高斯噪声
+                    noise = torch.randn_like(trial) * 0.01 * trial.std()
+                    trial = trial + noise
+                elif aug_type == 'scale':
+                    # 幅度缩放
+                    scale = random.uniform(0.9, 1.1)
+                    trial = trial * scale
+                elif aug_type == 'shift':
+                    # 时间平移
+                    n_samples = trial.shape[-1]
+                    shift = random.randint(-int(0.05*n_samples), int(0.05*n_samples))
+                    if shift != 0:
+                        shifted = torch.zeros_like(trial)
+                        if shift > 0:
+                            shifted[:, shift:] = trial[:, :-shift]
+                        else:
+                            shifted[:, :shift] = trial[:, -shift:]
+                        trial = shifted
+                elif aug_type == 'channel_dropout':
+                    # 随机丢弃通道
+                    n_channels = trial.shape[0]
+                    dropout_prob = 0.1
+                    mask = torch.rand(n_channels) > dropout_prob
+                    trial = trial * mask.unsqueeze(-1)
+                elif aug_type == 'time_jitter':
+                    # 时间抖动：随机重排小段时间窗口
+                    n_samples = trial.shape[-1]
+                    segment_size = min(50, n_samples // 10)  # 小段长度
+                    if segment_size > 1:
+                        n_segments = n_samples // segment_size
+                        if n_segments > 1:
+                            # 随机重排segments
+                            segments = trial[:, :n_segments*segment_size].view(
+                                trial.shape[0], n_segments, segment_size
+                            )
+                            perm = torch.randperm(n_segments)
+                            segments = segments[:, perm, :]
+                            trial[:, :n_segments*segment_size] = segments.view(
+                                trial.shape[0], -1
+                            )
             
             augmented_trials.append(trial.numpy())
             if labels is not None:
@@ -161,7 +188,9 @@ class SupervisedTrainer:
                  scheduler_type: str = 'cosine',
                  max_epochs: int = 200,
                  early_stopping_patience: int = 20,
-                 label_smoothing: float = 0.1):
+                 label_smoothing: float = 0.1,
+                 use_domain_adaptation: bool = True,
+                 mmd_weight: float = 0.1):
         """
         初始化监督训练器
         
@@ -181,6 +210,8 @@ class SupervisedTrainer:
         self.task_configs = task_configs
         self.max_epochs = max_epochs
         self.early_stopping_patience = early_stopping_patience
+        self.use_domain_adaptation = use_domain_adaptation
+        self.mmd_weight = mmd_weight
         
         # 优化器
         self.optimizer = AdamW(
@@ -279,8 +310,11 @@ class SupervisedTrainer:
                 # 辅助损失（MoE负载均衡）
                 aux_loss = outputs.get('aux_loss', torch.tensor(0.0, device=self.device))
                 
+                # 域自适应损失将在batch级别计算，这里先记录0
+                domain_loss = torch.tensor(0.0, device=self.device)
+                
                 # 总损失
-                task_loss = weighted_loss + aux_loss
+                task_loss = weighted_loss + aux_loss + self.mmd_weight * domain_loss
                 task_batch_losses.append(task_loss)
                 
                 # 记录
@@ -293,13 +327,46 @@ class SupervisedTrainer:
                 task_predictions[task_name].extend(preds.cpu().numpy())
                 task_targets[task_name].extend(task_labels.cpu().numpy())
             
+            # 计算batch级别的域自适应损失
+            batch_domain_loss = torch.tensor(0.0, device=self.device)
+            if self.use_domain_adaptation and task_batch_losses and len(set(task_names)) > 1:
+                # 收集所有任务的特征用于域对齐
+                all_task_features = {}
+                for task_name in set(task_names):
+                    task_mask = [tn == task_name for tn in task_names]
+                    if any(task_mask):
+                        task_indices = torch.tensor(task_mask, device=self.device)
+                        task_trials = trials[task_indices]
+                        task_outputs = self.model(task_trials, task_name=task_name, return_features=True)
+                        
+                        # 使用融合后的特征
+                        if 'multimodal_fused' in task_outputs['features']:
+                            all_task_features[task_name] = task_outputs['features']['multimodal_fused']
+                        else:
+                            all_task_features[task_name] = task_outputs['features']['pooled']
+                
+                # 计算MMD损失
+                if len(all_task_features) > 1:
+                    task_pairs = list(all_task_features.keys())
+                    mmd_losses = []
+                    for i in range(len(task_pairs)):
+                        for j in range(i + 1, len(task_pairs)):
+                            mmd_val = mmd_loss(
+                                all_task_features[task_pairs[i]], 
+                                all_task_features[task_pairs[j]]
+                            )
+                            mmd_losses.append(mmd_val)
+                    
+                    if mmd_losses:
+                        batch_domain_loss = sum(mmd_losses) / len(mmd_losses)
+            
             # 反向传播
             if task_batch_losses:
-                batch_loss = sum(task_batch_losses) / len(task_batch_losses)
+                batch_loss = sum(task_batch_losses) / len(task_batch_losses) + self.mmd_weight * batch_domain_loss
                 batch_loss.backward()
                 
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                # 梯度裁剪（可选）
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 
                 self.optimizer.step()
                 total_loss += batch_loss.item()
@@ -546,12 +613,24 @@ def main():
                        help='配置文件路径')
     parser.add_argument('--data_configs', type=str, nargs='+', required=True,
                        help='数据配置，格式：task_name:data_path')
-    parser.add_argument('--pretrained_path', type=str, default=None,
-                       help='预训练模型路径')
+    # 移除了SSL预训练支持，现在只支持外部预训练模型
     parser.add_argument('--save_dir', type=str, default='checkpoints/supervised',
                        help='模型保存目录')
     parser.add_argument('--device', type=str, default='cuda',
                        help='训练设备')
+    
+    # 预训练模型参数
+    parser.add_argument('--use_pretrained', action='store_true',
+                       help='是否使用外部预训练模型')
+    parser.add_argument('--pretrained_type', type=str, 
+                       choices=['huggingface', 'braindecode', 'checkpoint'],
+                       help='预训练模型类型')
+    parser.add_argument('--pretrained_model', type=str,
+                       help='预训练模型名称或类型')
+    parser.add_argument('--pretrained_checkpoint', type=str,
+                       help='预训练检查点路径')
+    parser.add_argument('--freeze_pretrained', action='store_true',
+                       help='是否冻结预训练权重')
     # 新增覆盖参数
     parser.add_argument('--batch_size', type=int, default=None,
                        help='覆盖配置中的batch_size')
@@ -684,15 +763,37 @@ def main():
         task_cfg = {k: v for k, v in config['model']['task_configs'].items() if k in data_configs}
         if task_cfg:
             config['model']['task_configs'] = task_cfg
-    model = create_mi_net(**config['model'])
     
-    # 加载预训练权重
-    if args.pretrained_path and os.path.exists(args.pretrained_path):
-        print(f"加载预训练模型: {args.pretrained_path}")
-        checkpoint = torch.load(args.pretrained_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    # 添加预训练参数到模型配置
+    model_config = config['model'].copy()
+    if args.use_pretrained:
+        print(f"\n=== 使用预训练模型 ===")
+        print(f"预训练类型: {args.pretrained_type}")
+        print(f"预训练模型: {args.pretrained_model}")
+        print(f"冻结预训练权重: {args.freeze_pretrained}")
+        
+        model_config.update({
+            'use_pretrained': True,
+            'pretrained_type': args.pretrained_type,
+            'pretrained_model': args.pretrained_model,
+            'pretrained_checkpoint': args.pretrained_checkpoint,
+            'freeze_pretrained': args.freeze_pretrained
+        })
+    
+    model = create_mi_net(**model_config)
+    
+    # SSL预训练功能已移除，现在只使用外部预训练模型
     
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # 显示预训练相关信息
+    if args.use_pretrained and hasattr(model, 'pretrained_backbone') and model.pretrained_backbone:
+        pretrained_params = sum(p.numel() for p in model.pretrained_backbone.parameters())
+        trainable_pretrained_params = sum(p.numel() for p in model.pretrained_backbone.parameters() if p.requires_grad)
+        print(f"预训练模块参数: {pretrained_params:,} (可训练: {trainable_pretrained_params:,})")
+        
+        if args.freeze_pretrained:
+            print("预训练权重已冻结，仅训练其他部分")
     
     # 创建训练器
     def _to_float(x, default):

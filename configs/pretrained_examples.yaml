@@ -1,0 +1,77 @@
+# 预训练模型使用示例配置
+
+# 示例1: 使用HuggingFace预训练模型
+huggingface_example:
+  model:
+    dataset_type: 'bnci2a'
+    n_channels: 22
+    n_samples: 751
+    sfreq: 250.0
+    
+    # 预训练配置
+    use_pretrained: true
+    pretrained_type: 'huggingface'
+    pretrained_model: 'prajjwal1/bert-tiny'  # 轻量级BERT模型
+    freeze_pretrained: true  # 冻结预训练权重，只训练适配层
+    
+    # 其他配置保持默认
+    use_graph_conv: false  # 简化模型
+    use_mamba_branch: false  # 禁用Mamba，使用预训练模型作为主要特征提取器
+    s4_d_model: 64
+    dropout: 0.3
+
+# 示例2: 使用Braindecode预训练模型
+braindecode_example:
+  model:
+    dataset_type: 'bnci2a'
+    n_channels: 22
+    n_samples: 751
+    sfreq: 250.0
+    
+    # 预训练配置
+    use_pretrained: true
+    pretrained_type: 'braindecode'
+    pretrained_model: 'eegnet'  # 使用EEGNet预训练
+    freeze_pretrained: false  # 允许微调
+    
+    # 简化其他模块
+    use_graph_conv: true
+    use_mamba_branch: true
+    s4_d_model: 64
+    mamba_d_model: 64
+    dropout: 0.2
+
+# 示例3: 使用自定义检查点
+checkpoint_example:
+  model:
+    dataset_type: 'bnci2a'
+    n_channels: 22
+    n_samples: 751
+    sfreq: 250.0
+    
+    # 预训练配置
+    use_pretrained: true
+    pretrained_type: 'checkpoint'
+    pretrained_checkpoint: 'path/to/your/pretrained_model.pth'
+    freeze_pretrained: false
+    
+    # 完整配置
+    use_graph_conv: true
+    use_s4_branch: true
+    use_mamba_branch: true
+    dropout: 0.2
+
+# 通用训练配置（适用于所有示例）
+training:
+  learning_rate: 1e-4  # 使用预训练时通常需要较小的学习率
+  weight_decay: 1e-3
+  batch_size: 16
+  max_epochs: 50
+  early_stopping_patience: 10
+  scheduler_type: 'cosine'
+  label_smoothing: 0.1
+
+augmentation:
+  enabled: true
+  augment_prob: 0.2  # 使用预训练时减少增强强度
+

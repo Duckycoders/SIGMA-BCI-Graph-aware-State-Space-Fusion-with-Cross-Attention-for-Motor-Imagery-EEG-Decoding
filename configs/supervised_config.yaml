@@ -5,35 +5,35 @@ model:
   n_samples: 751  # 使用实际数据长度，避免长度不匹配
   sfreq: 250.0
   
-  # FilterBank配置
-  filter_bands: [[4, 8], [8, 14], [14, 30], [30, 45]]
+  # FilterBank配置 - 简化为2个主要频带
+  filter_bands: [[8, 14], [14, 30]]  # 只使用α波和β波
   use_adaptive_filterbank: false
   
-  # 图卷积配置 - 启用并优化
-  use_graph_conv: true  # 启用图卷积
-  graph_hidden_dims: [32, 64]  # 适中维度
-  graph_output_dim: 64         # 输出维度
+  # 图卷积配置 - 暂时禁用以简化
+  use_graph_conv: false  # 禁用图卷积
+  graph_hidden_dims: [32, 64]
+  graph_output_dim: 64
   
-  # S4分支配置 - 简化模型维度
+  # S4分支配置 - 进一步简化
   use_s4_branch: true
-  s4_d_model: 64   # 优化维度
-  s4_d_state: 32   # 优化状态维度
-  s4_n_layers: 2
+  s4_d_model: 32   # 减少维度
+  s4_d_state: 16   # 减少状态维度
+  s4_n_layers: 1   # 减少到1层
   
-  # Mamba分支配置 - 启用并优化
-  use_mamba_branch: true  # 启用Mamba
-  mamba_d_model: 64  # 优化维度
+  # Mamba分支配置 - 启用纯PyTorch实现
+  use_mamba_branch: true   # 启用Mamba分支
+  mamba_d_model: 32
   mamba_d_state: 16
-  mamba_n_layers: 2
+  mamba_n_layers: 1
   
-  # 融合配置 - 减少attention头数
-  fusion_method: 'cross_attention'
-  fusion_n_heads: 4  # 减少从8到4
+  # 融合配置 - 简化
+  fusion_method: 'simple'
+  fusion_n_heads: 2
   
-  # MoE配置 - 简化以减少过拟合
-  use_moe: true
-  moe_n_experts: 2  # 减少专家数量从4到2
-  moe_top_k: 1      # 减少top_k从2到1
+  # MoE配置 - 禁用以简化
+  use_moe: false
+  moe_n_experts: 2
+  moe_top_k: 1
   
   # 多任务配置
   task_configs:
@@ -47,28 +47,43 @@ model:
       d_output: 4
       top_k: 2
   
-  # 通用配置 - 增加正则化
-  dropout: 0.2  # 增加dropout从0.1到0.2
+  # 通用配置 - 减少正则化
+  dropout: 0.1  # 降低dropout
+  
+  # Riemann几何特征分支配置
+  use_riemann_branch: true  # 启用Riemann分支
+  riemann_tangent_space: true  # 使用切空间映射
+  
+  # 预训练模型配置（可选）
+  use_pretrained: false
+  pretrained_type: null  # 'huggingface', 'braindecode', 'checkpoint'
+  pretrained_model: null  # 具体模型名称
+  pretrained_checkpoint: null  # 检查点路径
+  freeze_pretrained: false  # 是否冻结预训练权重
 
 training:
-  # 优化器配置 - 优化稳定性
-  learning_rate: 5e-4      # 降低学习率从1e-3到5e-4
-  weight_decay: 1e-3       # 增加weight_decay从1e-4到1e-3
+  # 优化器配置 - 提高学习率
+  learning_rate: 1e-3      # 提高学习率
+  weight_decay: 1e-4       # 降低weight_decay
   
-  # 训练配置 - RTX 3060 Laptop优化
-  batch_size: 8            # 笔记本GPU较小batch_size
-  max_epochs: 30           # 增加epoch数但使用早停
-  early_stopping_patience: 8  # 增加早停patience
+  # 训练配置 - 优化训练速度
+  batch_size: 16           # 增加batch_size
+  max_epochs: 50           # 增加epoch数
+  early_stopping_patience: 15  # 增加patience
   
-  # 正则化配置
-  gradient_clip_val: 1.0   # 添加梯度裁剪
-  early_stopping_min_delta: 0.001  # 早停最小改进
+  # 正则化配置 - 减少正则化
+  gradient_clip_val: null  # 禁用梯度裁剪
+  early_stopping_min_delta: 0.01  # 放宽早停条件
   
   # 调度器配置
-  scheduler_type: 'cosine'  # 'cosine', 'step', 'plateau'
+  scheduler_type: 'step'   # 使用step调度器
   
   # 损失配置
-  label_smoothing: 0.1
+  label_smoothing: 0.0     # 禁用标签平滑
+  
+  # 域自适应配置
+  use_domain_adaptation: true  # 启用MMD域自适应
+  mmd_weight: 0.1  # MMD损失权重
   
   # 任务权重
   task_weights:
@@ -78,6 +93,6 @@ training:
     default: 1.0  # 默认任务权重
 
 augmentation:
-  enabled: true
-  augment_prob: 0.3  # 简化的增强概率
+  enabled: true      # 启用改进的数据增强
+  augment_prob: 0.3  # 增强概率
 

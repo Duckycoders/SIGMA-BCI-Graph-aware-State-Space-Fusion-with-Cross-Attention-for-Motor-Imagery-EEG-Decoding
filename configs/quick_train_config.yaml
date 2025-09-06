@@ -1,0 +1,77 @@
+# 快速训练配置 - 小参数，3个epoch演示
+model:
+  dataset_type: 'bnci2a'
+  n_channels: 22
+  n_samples: 751
+  sfreq: 250.0
+  
+  # FilterBank配置 - 减少频带
+  filter_bands: [[8, 14], [14, 30]]  # 只用α波和β波
+  use_adaptive_filterbank: false
+  
+  # 图卷积配置 - 启用（使用简化实现）
+  use_graph_conv: true
+  graph_hidden_dims: [32, 64]
+  graph_output_dim: 64
+  
+  # S4分支配置 - 小参数
+  use_s4_branch: true
+  s4_d_model: 64    # 减小模型维度
+  s4_d_state: 32    # 减小状态维度
+  s4_n_layers: 1    # 只用1层
+  
+  # Mamba分支配置 - 小参数
+  use_mamba_branch: true
+  mamba_d_model: 64
+  mamba_d_state: 16
+  mamba_n_layers: 1
+  
+  # 融合配置
+  fusion_method: 'cross_attention'
+  fusion_n_heads: 4
+  
+  # MoE配置 - 简化
+  use_moe: true
+  moe_n_experts: 2   # 减少专家数
+  moe_top_k: 1
+  
+  # Riemann分支配置
+  use_riemann_branch: true
+  riemann_tangent_space: true
+  
+  # 多任务配置
+  task_configs:
+    bnci2a:
+      d_output: 4
+      top_k: 1
+  
+  # 通用配置
+  dropout: 0.1
+
+training:
+  # 优化器配置
+  learning_rate: 2e-3     # 稍微提高学习率
+  weight_decay: 1e-4
+  
+  # 训练配置 - 快速训练
+  batch_size: 32          # 较大batch size
+  max_epochs: 3           # 只训练3个epoch
+  early_stopping_patience: 10
+  
+  # 调度器配置
+  scheduler_type: 'cosine'
+  
+  # 损失配置
+  label_smoothing: 0.0
+  
+  # 域自适应配置
+  use_domain_adaptation: true
+  mmd_weight: 0.1
+  
+  # 任务权重
+  task_weights:
+    bnci2a: 1.0
+
+augmentation:
+  enabled: true
+  augment_prob: 0.2  # 降低增强概率，加快训练

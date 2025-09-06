@@ -10,13 +10,200 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
 import warnings
+import math
 
 from .filterbank import FilterBankLayer, AdaptiveFilterBank
 from .graph import EEGGraphNet, create_electrode_graph
 from .s4_branch import S4Branch
-from .mamba_branch import MambaBranch, create_mamba_branch
+from .mamba_branch import MambaBranch, create_mamba_branch, MAMBA_AVAILABLE
 from .fusion import CrossAttentionFusion, MultiScaleFusion
 from .moe_adapter import MoEAdapter, MultiTaskMoEAdapter
+from .pretrained_adapters import create_pretrained_backbone, PretrainedModelLoader
+
+
+class RiemannianBranch(nn.Module):
+    """Riemann几何特征分支：基于协方差矩阵的切空间特征"""
+    
+    def __init__(self, n_channels: int, n_classes: int = None, use_tangent_space: bool = True):
+        """
+        初始化Riemann分支
+        
+        Args:
+            n_channels: EEG通道数
+            n_classes: 分类数（如果None则只输出特征）
+            use_tangent_space: 是否使用切空间映射
+        """
+        super().__init__()
+        self.n_channels = n_channels
+        self.use_tangent_space = use_tangent_space
+        
+        # 协方差矩阵特征维度
+        self.cov_dim = n_channels * (n_channels + 1) // 2
+        
+        # 参考协方差矩阵（用于切空间映射）
+        self.register_buffer('reference_cov', torch.eye(n_channels))
+        
+        # 特征变换层
+        self.feature_transform = nn.Sequential(
+            nn.Linear(self.cov_dim, self.cov_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.cov_dim // 2, self.cov_dim // 4)
+        )
+        
+        # 分类头（可选）
+        if n_classes is not None:
+            self.classifier = nn.Linear(self.cov_dim // 4, n_classes)
+        else:
+            self.classifier = None
+            
+        print(f"Riemann分支初始化: {n_channels}通道 -> {self.cov_dim}协方差特征 -> {self.cov_dim // 4}输出特征")
+    
+    def _compute_covariance(self, x: torch.Tensor) -> torch.Tensor:
+        """计算协方差矩阵"""
+        # x: (batch, channels, time) 或其他形状，需要处理
+        if x.dim() == 3:
+            batch_size, n_channels, n_time = x.shape
+        elif x.dim() == 4:
+            # 如果是FilterBank输出 (batch, n_bands, channels, time)，取第一个频带
+            batch_size, n_bands, n_channels, n_time = x.shape
+            x = x[:, 0, :, :]  # 只使用第一个频带
+        else:
+            raise ValueError(f"不支持的输入形状: {x.shape}")
+        
+        # 中心化
+        x_centered = x - x.mean(dim=-1, keepdim=True)
+        
+        # 计算协方差矩阵: (batch, channels, channels)
+        cov_matrices = torch.bmm(x_centered, x_centered.transpose(-1, -2)) / (n_time - 1)
+        
+        # 添加正则化避免奇异矩阵
+        eye = torch.eye(n_channels, device=x.device, dtype=x.dtype)
+        cov_matrices = cov_matrices + 1e-6 * eye.unsqueeze(0)
+        
+        return cov_matrices
+    
+    def _tangent_space_mapping(self, cov_matrices: torch.Tensor) -> torch.Tensor:
+        """将协方差矩阵映射到参考点的切空间"""
+        batch_size = cov_matrices.shape[0]
+        
+        # 计算参考协方差的逆平方根
+        ref_cov_inv_sqrt = self._matrix_power(self.reference_cov, -0.5)
+        
+        # 映射到切空间
+        tangent_matrices = []
+        for i in range(batch_size):
+            # 计算 ref_cov^{-1/2} @ cov @ ref_cov^{-1/2}
+            normalized_cov = ref_cov_inv_sqrt @ cov_matrices[i] @ ref_cov_inv_sqrt
+            
+            # 矩阵对数
+            tangent_matrix = self._matrix_log(normalized_cov)
+            tangent_matrices.append(tangent_matrix)
+        
+        tangent_matrices = torch.stack(tangent_matrices, dim=0)
+        return tangent_matrices
+    
+    def _matrix_power(self, matrix: torch.Tensor, power: float) -> torch.Tensor:
+        """计算矩阵的幂"""
+        eigenvals, eigenvecs = torch.linalg.eigh(matrix)
+        eigenvals = torch.clamp(eigenvals, min=1e-8)  # 避免负特征值
+        powered_eigenvals = torch.pow(eigenvals, power)
+        return eigenvecs @ torch.diag(powered_eigenvals) @ eigenvecs.T
+    
+    def _matrix_log(self, matrix: torch.Tensor) -> torch.Tensor:
+        """计算矩阵对数"""
+        eigenvals, eigenvecs = torch.linalg.eigh(matrix)
+        eigenvals = torch.clamp(eigenvals, min=1e-8)
+        log_eigenvals = torch.log(eigenvals)
+        return eigenvecs @ torch.diag(log_eigenvals) @ eigenvecs.T
+    
+    def _vectorize_symmetric_matrix(self, matrices: torch.Tensor) -> torch.Tensor:
+        """将对称矩阵向量化（只取上三角部分）"""
+        batch_size, n, _ = matrices.shape
+        
+        # 获取上三角部分的索引
+        triu_indices = torch.triu_indices(n, n, offset=0)
+        
+        # 提取上三角元素
+        vectors = matrices[:, triu_indices[0], triu_indices[1]]
+        
+        # 对角线元素保持不变，非对角线元素乘以sqrt(2)以保持范数
+        mask = triu_indices[0] != triu_indices[1]
+        vectors[:, mask] *= math.sqrt(2)
+        
+        return vectors
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        
+        Args:
+            x: EEG数据 (batch, channels, time)
+            
+        Returns:
+            Riemann特征或分类结果
+        """
+        # 计算协方差矩阵
+        cov_matrices = self._compute_covariance(x)
+        
+        # 切空间映射（可选）
+        if self.use_tangent_space:
+            tangent_matrices = self._tangent_space_mapping(cov_matrices)
+        else:
+            tangent_matrices = cov_matrices
+        
+        # 向量化对称矩阵
+        features = self._vectorize_symmetric_matrix(tangent_matrices)
+        
+        # 特征变换
+        features = self.feature_transform(features)
+        
+        # 分类（如果需要）
+        if self.classifier is not None:
+            logits = self.classifier(features)
+            return logits
+        
+        return features
+
+
+def mmd_loss(source_features: torch.Tensor, 
+             target_features: torch.Tensor, 
+             kernel: str = 'rbf', 
+             sigma: float = 1.0) -> torch.Tensor:
+    """
+    最大均值差异(MMD)损失，用于域自适应
+    
+    Args:
+        source_features: 源域特征 (batch1, feature_dim)
+        target_features: 目标域特征 (batch2, feature_dim)
+        kernel: 核函数类型
+        sigma: RBF核的带宽参数
+        
+    Returns:
+        MMD损失值
+    """
+    if source_features.shape[0] == 0 or target_features.shape[0] == 0:
+        return torch.tensor(0.0, device=source_features.device)
+    
+    def rbf_kernel(x1, x2, sigma=1.0):
+        """RBF核函数"""
+        # x1: (n1, d), x2: (n2, d)
+        # 返回: (n1, n2)
+        x1_norm = (x1 ** 2).sum(dim=1, keepdim=True)  # (n1, 1)
+        x2_norm = (x2 ** 2).sum(dim=1, keepdim=True)  # (n2, 1)
+        
+        dist_sq = x1_norm + x2_norm.T - 2 * torch.mm(x1, x2.T)
+        return torch.exp(-dist_sq / (2 * sigma ** 2))
+    
+    # 计算各项核矩阵
+    K_ss = rbf_kernel(source_features, source_features, sigma)
+    K_tt = rbf_kernel(target_features, target_features, sigma)
+    K_st = rbf_kernel(source_features, target_features, sigma)
+    
+    # MMD^2 = E[K(xs,xs)] + E[K(xt,xt)] - 2*E[K(xs,xt)]
+    mmd_sq = K_ss.mean() + K_tt.mean() - 2 * K_st.mean()
+    
+    return torch.sqrt(torch.clamp(mmd_sq, min=0.0))
 
 
 class MINet(nn.Module):
@@ -33,6 +220,13 @@ class MINet(nn.Module):
                  n_samples: int,
                  sfreq: float = 250.0,
                  electrode_positions: Dict[str, np.ndarray] = None,
+                 
+                 # 预训练配置
+                 use_pretrained: bool = False,
+                 pretrained_type: str = None,  # 'huggingface', 'braindecode', 'checkpoint'
+                 pretrained_model: str = None,
+                 pretrained_checkpoint: str = None,
+                 freeze_pretrained: bool = False,
                  
                  # FilterBank配置
                  filter_bands: List[Tuple[float, float]] = None,
@@ -69,6 +263,10 @@ class MINet(nn.Module):
                  
                  # 通用配置
                  dropout: float = 0.1,
+                 
+                 # Riemann分支配置
+                 use_riemann_branch: bool = True,
+                 riemann_tangent_space: bool = True,
                  
                  # 模块开关（用于消融实验）
                  module_switches: Dict[str, bool] = None):
@@ -118,11 +316,15 @@ class MINet(nn.Module):
         self.use_mamba_branch = module_switches.get('mamba_branch', use_mamba_branch)
         self.use_fusion = module_switches.get('fusion', True)
         self.use_moe = module_switches.get('moe', use_moe)
+        self.use_riemann_branch = module_switches.get('riemann_branch', use_riemann_branch)
         
         # 确保至少有一个序列建模分支
         if not (self.use_s4_branch or self.use_mamba_branch):
             self.use_s4_branch = True
             print("警告: 至少需要一个序列建模分支，启用S4分支")
+        
+        # 直接使用双S4架构（Mamba分支已经是S4实现）
+        print("使用双S4架构：S4分支 + Mamba分支（S4实现）")
         
         # 设置默认值
         if filter_bands is None:
@@ -136,6 +338,35 @@ class MINet(nn.Module):
         self.filter_bands = filter_bands
         self.n_bands = len(filter_bands)
         self.task_configs = task_configs
+        self.use_pretrained = use_pretrained
+        
+        # 0. 预训练模型模块（如果启用）
+        if use_pretrained and pretrained_type:
+            print(f"初始化预训练模型: {pretrained_type} - {pretrained_model}")
+            
+            if pretrained_type in ['huggingface', 'braindecode']:
+                self.pretrained_backbone = create_pretrained_backbone(
+                    pretrained_type=pretrained_type,
+                    model_name=pretrained_model,
+                    n_channels=n_channels,
+                    n_samples=n_samples,
+                    d_model=max(s4_d_model, mamba_d_model),
+                    freeze_pretrained=freeze_pretrained
+                )
+                # 预训练模型输出维度
+                pretrained_output_dim = max(s4_d_model, mamba_d_model)
+                
+            elif pretrained_type == 'checkpoint' and pretrained_checkpoint:
+                # 稍后在模型构建完成后加载检查点
+                self.pretrained_backbone = None
+                pretrained_output_dim = None
+            else:
+                print("警告: 预训练配置不完整，跳过预训练模块")
+                self.pretrained_backbone = None
+                pretrained_output_dim = None
+        else:
+            self.pretrained_backbone = None
+            pretrained_output_dim = None
         
         # 1. FilterBank模块
         if self.use_filterbank:
@@ -191,6 +422,8 @@ class MINet(nn.Module):
                 dropout=dropout
             )
         
+        # 删除了双S4模式的复杂逻辑，Mamba分支现在直接是S4实现
+        
         if self.use_mamba_branch:
             self.mamba_branch = create_mamba_branch(
                 d_input=feature_dim,
@@ -244,10 +477,33 @@ class MINet(nn.Module):
                 fusion_type='attention'
             )
         
-        # 6. 全局池化
+        # 6. Riemann几何分支
+        if self.use_riemann_branch:
+            self.riemann_branch = RiemannianBranch(
+                n_channels=n_channels,
+                n_classes=None,  # 只输出特征，不直接分类
+                use_tangent_space=riemann_tangent_space
+            )
+            riemann_feature_dim = n_channels * (n_channels + 1) // 8  # cov_dim // 4
+        else:
+            riemann_feature_dim = 0
+        
+        # 7. 全局池化
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         
-        # 7. MoE Adapter和分类头
+        # 8. 多模态融合层
+        multimodal_input_dim = fusion_output_dim + riemann_feature_dim
+        if multimodal_input_dim > fusion_output_dim:
+            self.multimodal_fusion = nn.Sequential(
+                nn.Linear(multimodal_input_dim, fusion_output_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+            print(f"多模态融合: {multimodal_input_dim} -> {fusion_output_dim}")
+        else:
+            self.multimodal_fusion = nn.Identity()
+        
+        # 9. MoE Adapter和分类头
         if self.use_moe and len(task_configs) > 1:
             # 多任务MoE
             self.moe_adapter = MultiTaskMoEAdapter(
@@ -290,6 +546,7 @@ class MINet(nn.Module):
         print(f"  S4分支: {'✓' if self.use_s4_branch else '✗'}")
         print(f"  Mamba分支: {'✓' if self.use_mamba_branch else '✗'}")
         print(f"  融合模块: {'✓' if self.use_fusion else '✗'}")
+        print(f"  Riemann分支: {'✓' if self.use_riemann_branch else '✗'}")
         print(f"  MoE: {'✓' if self.use_moe else '✗'}")
         print(f"  任务数: {len(self.task_configs)}")
     
@@ -313,6 +570,17 @@ class MINet(nn.Module):
         batch_size, n_channels, n_samples = x.shape
         features = {}
         
+        # 保存原始输入用于Riemann分支
+        original_input = x.clone() if self.use_riemann_branch else None
+        
+        # 0. 预训练模型处理（如果启用）
+        if self.use_pretrained and self.pretrained_backbone is not None:
+            pretrained_features = self.pretrained_backbone(x)  # 输出形状取决于具体模型
+            features['pretrained'] = pretrained_features
+            
+            # 如果预训练模型输出是序列特征，可以直接跳过后续的序列建模
+            # 这里我们选择将预训练特征作为额外输入，与原始流程并行
+            
         # 1. FilterBank处理
         if self.use_filterbank:
             x = self.filterbank(x)  # (batch, n_bands, n_channels, n_samples)
@@ -430,19 +698,35 @@ class MINet(nn.Module):
         pooled = self.dropout(pooled)
         features['pooled'] = pooled
         
+        # 7. Riemann分支处理
+        riemann_features = None
+        if self.use_riemann_branch and original_input is not None:
+            # 使用原始输入计算Riemann特征
+            riemann_features = self.riemann_branch(original_input)  # (batch, riemann_dim)
+            features['riemann'] = riemann_features
+        
+        # 8. 多模态特征融合
+        if riemann_features is not None:
+            # 拼接深度学习特征和Riemann特征
+            combined_features = torch.cat([pooled, riemann_features], dim=-1)
+            fused_features = self.multimodal_fusion(combined_features)
+            features['multimodal_fused'] = fused_features
+        else:
+            fused_features = pooled
+        
         # 7. MoE和分类
         aux_loss = None
         
         if self.use_moe:
             if isinstance(self.moe_adapter, MultiTaskMoEAdapter):
                 # 多任务MoE
-                moe_result = self.moe_adapter(pooled, task_name)
+                moe_result = self.moe_adapter(fused_features, task_name)
                 logits = moe_result['output']
                 if 'aux_loss' in moe_result:
                     aux_loss = moe_result['aux_loss']
             else:
                 # 单任务MoE
-                moe_result = self.moe_adapter(pooled)
+                moe_result = self.moe_adapter(fused_features)
                 moe_output = moe_result['output']
                 if 'aux_loss' in moe_result:
                     aux_loss = moe_result['aux_loss']
@@ -451,7 +735,7 @@ class MINet(nn.Module):
                 logits = self.classifiers[task_name](moe_output)
         else:
             # 直接分类
-            logits = self.classifiers[task_name](pooled)
+            logits = self.classifiers[task_name](fused_features)
         
         # 构建返回结果
         result = {
@@ -482,7 +766,13 @@ class MINet(nn.Module):
         return param_counts
 
 
-def create_mi_net(dataset_type: str = 'bnci2a', **kwargs) -> MINet:
+def create_mi_net(dataset_type: str = 'bnci2a', 
+                  use_pretrained: bool = False,
+                  pretrained_type: str = None,
+                  pretrained_model: str = None,
+                  pretrained_checkpoint: str = None,
+                  use_riemann_branch: bool = True,
+                  **kwargs) -> MINet:
     """
     创建MI-Net的便捷函数
     
@@ -528,10 +818,28 @@ def create_mi_net(dataset_type: str = 'bnci2a', **kwargs) -> MINet:
             }
         }
     
-    # 合并配置
-    config = {**default_config, **kwargs}
+    # 合并配置，添加预训练和Riemann分支参数
+    config = {
+        **default_config, 
+        'use_pretrained': use_pretrained,
+        'pretrained_type': pretrained_type,
+        'pretrained_model': pretrained_model,
+        'pretrained_checkpoint': pretrained_checkpoint,
+        'use_riemann_branch': use_riemann_branch,
+        **kwargs
+    }
     
-    return MINet(**config)
+    model = MINet(**config)
+    
+    # 如果指定了检查点路径，加载预训练权重
+    if use_pretrained and pretrained_type == 'checkpoint' and pretrained_checkpoint:
+        model = PretrainedModelLoader.load_checkpoint(
+            pretrained_checkpoint, 
+            model, 
+            strict=False
+        )
+    
+    return model
 
 
 if __name__ == "__main__":

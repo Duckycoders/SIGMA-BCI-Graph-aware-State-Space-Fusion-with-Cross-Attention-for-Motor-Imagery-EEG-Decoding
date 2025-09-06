@@ -1,34 +1,176 @@
 #!/usr/bin/env python3
 """
-Mamba分支模块
-优先使用mamba-ssm包，安装失败时自动回退到S4-only模式
+Mamba分支模块 - 纯PyTorch实现
+不依赖mamba-ssm包，完全用PyTorch实现Mamba核心机制
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 from typing import Optional, Tuple, Any
-import warnings
-import logging
 
-# 尝试导入Mamba
-MAMBA_AVAILABLE = False
+# 检查是否有mamba-ssm包，如果没有就使用我们的纯PyTorch实现
 try:
-    from mamba_ssm import Mamba
-    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+    from mamba_ssm import Mamba as OfficialMamba
     MAMBA_AVAILABLE = True
-    print("Mamba-SSM 成功导入")
-except ImportError as e:
-    print(f"警告: Mamba-SSM 导入失败 - {e}")
-    print("将使用S4-only回退模式")
-    # 导入S4作为回退
-    from .s4_branch import S4Block
+    print("✓ 使用官方mamba-ssm包")
+except ImportError:
     MAMBA_AVAILABLE = False
+    print("✓ 使用纯PyTorch Mamba实现")
+
+
+class PurePyTorchMamba(nn.Module):
+    """纯PyTorch实现的Mamba层"""
+    
+    def __init__(self, 
+                 d_model: int, 
+                 d_state: int = 16, 
+                 d_conv: int = 4,
+                 expand: int = 2,
+                 dt_rank: int = None,
+                 dt_min: float = 0.001,
+                 dt_max: float = 0.1,
+                 dt_init: str = "random",
+                 dt_scale: float = 1.0,
+                 dt_init_floor: float = 1e-4):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = dt_rank or math.ceil(self.d_model / 16)
+        
+        # 输入投影
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        
+        # 1D卷积
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=True,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+        )
+        
+        # SSM参数
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        
+        # 初始化dt参数
+        dt_init_std = self.dt_rank**-0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        
+        # 初始化dt偏置
+        dt = torch.exp(
+            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        # 逆softplus
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        
+        # A参数（状态转移矩阵）
+        A = torch.arange(1, self.d_state + 1, dtype=torch.float32)[None, :].repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        
+        # D参数（跳跃连接）
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        
+        # 输出投影
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, length, dim)
+        Returns:
+            output: (batch, length, dim)
+        """
+        batch, length, dim = x.shape
+        
+        # 输入投影
+        xz = self.in_proj(x)  # (batch, length, 2 * d_inner)
+        x, z = xz.chunk(2, dim=-1)  # each: (batch, length, d_inner)
+        
+        # 1D卷积（需要转置）
+        x = x.transpose(1, 2)  # (batch, d_inner, length)
+        x = self.conv1d(x)[:, :, :length]  # 去除padding
+        x = x.transpose(1, 2)  # (batch, length, d_inner)
+        
+        # 激活
+        x = F.silu(x)
+        
+        # SSM
+        y = self.ssm(x)
+        
+        # 门控
+        y = y * F.silu(z)
+        
+        # 输出投影
+        output = self.out_proj(y)
+        
+        return output
+    
+    def ssm(self, x: torch.Tensor) -> torch.Tensor:
+        """Selective State Space Model"""
+        batch, length, d_inner = x.shape
+        
+        # 计算dt, B, C
+        x_dbl = self.x_proj(x)  # (batch, length, dt_rank + 2*d_state)
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        
+        # dt投影
+        dt = self.dt_proj(dt)  # (batch, length, d_inner)
+        dt = F.softplus(dt)
+        
+        # A矩阵
+        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+        
+        # Debug维度
+        # print(f"Debug: dt.shape={dt.shape}, A.shape={A.shape}")
+        # print(f"Debug: d_inner={d_inner}, self.d_inner={self.d_inner}")
+        
+        # 离散化 - 修复维度匹配
+        # A_bar = exp(A * dt)
+        # 需要确保dt和A的维度匹配
+        dt_expanded = dt.unsqueeze(-1)  # (batch, length, d_inner, 1)
+        A_expanded = A.unsqueeze(0).unsqueeze(0)  # (1, 1, d_inner, d_state)
+        dt_A = dt_expanded * A_expanded  # (batch, length, d_inner, d_state)
+        A_bar = torch.exp(dt_A)
+        
+        # B_bar = (A^{-1} * (A_bar - I)) * B
+        # 简化：B_bar ≈ dt * B
+        dt_B = torch.einsum("bld,bls->blds", dt, B)  # (batch, length, d_inner, d_state)
+        
+        # 选择性扫描（简化版本）
+        # 这里使用一个简化的递推实现
+        h = torch.zeros(batch, d_inner, self.d_state, device=x.device, dtype=x.dtype)
+        ys = []
+        
+        for i in range(length):
+            # h = A_bar[i] * h + B_bar[i] * x[i]
+            h = A_bar[:, i] * h + dt_B[:, i] * x[:, i].unsqueeze(-1)
+            
+            # y = C[i] * h + D * x[i]
+            y = torch.einsum("bns,bs->bn", h, C[:, i]) + self.D * x[:, i]
+            ys.append(y)
+        
+        y = torch.stack(ys, dim=1)  # (batch, length, d_inner)
+        
+        return y
 
 
 class MambaBlock(nn.Module):
-    """Mamba块：原生Mamba实现的封装"""
+    """Mamba块：支持官方实现和纯PyTorch实现"""
     
     def __init__(self,
                  d_model: int,
@@ -53,21 +195,20 @@ class MambaBlock(nn.Module):
         self.d_model = d_model
         
         if MAMBA_AVAILABLE:
-            # 使用原生Mamba
-            self.mamba_layer = Mamba(
+            # 使用官方mamba-ssm实现
+            self.mamba_layer = OfficialMamba(
                 d_model=d_model,
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
-                use_fast_path=use_fast_path
             )
         else:
-            # 回退到S4
-            print("警告: 使用S4作为Mamba的回退实现")
-            self.mamba_layer = S4Block(
+            # 使用纯PyTorch实现
+            self.mamba_layer = PurePyTorchMamba(
                 d_model=d_model,
-                d_state=d_state * 4,  # S4使用更大的状态维度
-                dropout=dropout
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
             )
         
         # 归一化和dropout
@@ -87,120 +228,11 @@ class MambaBlock(nn.Module):
         # 预归一化
         x_norm = self.norm(x)
         
-        # Mamba/S4层
-        if MAMBA_AVAILABLE:
-            # 原生Mamba
-            mamba_out = self.mamba_layer(x_norm)
-        else:
-            # S4回退
-            mamba_out = self.mamba_layer(x_norm)
+        # Mamba层
+        mamba_out = self.mamba_layer(x_norm)
         
         # 残差连接和dropout
         output = x + self.dropout(mamba_out)
-        
-        return output
-
-
-class SimpleMambaImplementation(nn.Module):
-    """简化的Mamba实现（当mamba-ssm不可用时的备选）"""
-    
-    def __init__(self,
-                 d_model: int,
-                 d_state: int = 16,
-                 d_conv: int = 4,
-                 expand: int = 2):
-        """
-        简化Mamba实现
-        
-        Args:
-            d_model: 模型维度
-            d_state: 状态维度
-            d_conv: 卷积核大小
-            expand: 扩展因子
-        """
-        super().__init__()
-        
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_inner = int(expand * d_model)
-        
-        # 输入投影
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-        
-        # 1D卷积
-        self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            kernel_size=d_conv,
-            bias=True,
-            padding=d_conv - 1,
-            groups=self.d_inner,
-        )
-        
-        # SSM参数
-        self.x_proj = nn.Linear(self.d_inner, d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
-        
-        # 状态空间矩阵
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0)
-        A = A.expand(self.d_inner, -1)
-        self.A_log = nn.Parameter(torch.log(A))
-        
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-        
-        # 输出投影
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """简化的Mamba前向传播"""
-        batch_size, seq_len, d_model = x.shape
-        
-        # 输入投影和分割
-        xz = self.in_proj(x)  # (B, L, 2*d_inner)
-        x, z = xz.chunk(2, dim=-1)  # (B, L, d_inner) each
-        
-        # 1D卷积
-        x = x.transpose(-1, -2)  # (B, d_inner, L)
-        x = self.conv1d(x)[..., :seq_len]  # 移除padding
-        x = x.transpose(-1, -2)  # (B, L, d_inner)
-        x = F.silu(x)
-        
-        # SSM计算（简化版）
-        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-        
-        # 选择性机制
-        x_dbl = self.x_proj(x)  # (B, L, 2*d_state)
-        delta, B = x_dbl.chunk(2, dim=-1)  # (B, L, d_state) each
-        
-        delta = F.softplus(self.dt_proj(x))  # (B, L, d_inner)
-        
-        # 离散化（简化）
-        deltaA = torch.exp(delta.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))  # (B, L, d_inner, d_state)
-        deltaB = delta.unsqueeze(-1) * B.unsqueeze(-2)  # (B, L, d_inner, d_state)
-        
-        # 状态空间递推（简化为并行扫描）
-        # 这里使用简化的计算，实际Mamba使用更复杂的并行扫描算法
-        states = torch.zeros(batch_size, self.d_inner, self.d_state, device=x.device)
-        outputs = []
-        
-        for t in range(seq_len):
-            # 状态更新
-            states = deltaA[:, t] * states + deltaB[:, t] * x[:, t].unsqueeze(-1)
-            # 输出计算
-            C = B[:, t].unsqueeze(1)  # (B, 1, d_state)
-            y = torch.sum(C * states, dim=-1)  # (B, d_inner)
-            outputs.append(y)
-        
-        y = torch.stack(outputs, dim=1)  # (B, L, d_inner)
-        
-        # 跳跃连接
-        y = y + self.D * x
-        
-        # 门控
-        y = y * F.silu(z)
-        
-        # 输出投影
-        output = self.out_proj(y)
         
         return output
 
@@ -239,63 +271,36 @@ class MambaBranch(nn.Module):
         self.n_layers = n_layers
         self.use_final_norm = use_final_norm
         
-        # 检查Mamba可用性
-        self.mamba_available = MAMBA_AVAILABLE and not use_simple_fallback
-        
         # 输入投影
-        self.input_projection = nn.Linear(d_input, d_model)
+        if d_input != d_model:
+            self.input_projection = nn.Linear(d_input, d_model)
+        else:
+            self.input_projection = nn.Identity()
         
         # Mamba层堆叠
-        if self.mamba_available:
-            print(f"使用原生Mamba实现，{n_layers}层")
-            self.mamba_layers = nn.ModuleList([
-                MambaBlock(
-                    d_model=d_model,
-                    d_state=d_state,
-                    d_conv=d_conv,
-                    expand=expand,
-                    dropout=dropout
-                )
-                for _ in range(n_layers)
-            ])
-        else:
-            if use_simple_fallback:
-                print(f"使用简化Mamba实现，{n_layers}层")
-                self.mamba_layers = nn.ModuleList([
-                    SimpleMambaImplementation(
-                        d_model=d_model,
-                        d_state=d_state,
-                        d_conv=d_conv,
-                        expand=expand
-                    )
-                    for _ in range(n_layers)
-                ])
-                # 添加归一化层
-                self.layer_norms = nn.ModuleList([
-                    nn.LayerNorm(d_model) for _ in range(n_layers)
-                ])
-            else:
-                print(f"使用S4回退实现，{n_layers}层")
-                from .s4_branch import S4Block
-                self.mamba_layers = nn.ModuleList([
-                    S4Block(
-                        d_model=d_model,
-                        d_state=d_state * 4,
-                        dropout=dropout
-                    )
-                    for _ in range(n_layers)
-                ])
+        self.mamba_layers = nn.ModuleList([
+            MambaBlock(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                dropout=dropout
+            )
+            for _ in range(n_layers)
+        ])
         
         # 最终归一化
         if use_final_norm:
             self.final_norm = nn.LayerNorm(d_model)
+        else:
+            self.final_norm = nn.Identity()
         
         print(f"Mamba分支初始化:")
         print(f"  输入维度: {d_input}")
         print(f"  模型维度: {d_model}")
         print(f"  状态维度: {d_state}")
         print(f"  层数: {n_layers}")
-        print(f"  实现类型: {'原生Mamba' if self.mamba_available else '回退实现'}")
+        print(f"  实现类型: {'官方mamba-ssm' if MAMBA_AVAILABLE else '纯PyTorch'}")
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -327,16 +332,9 @@ class MambaBranch(nn.Module):
         # 输入投影
         x = self.input_projection(x)  # (..., seq_len, d_model)
         
-        # 通过Mamba层
-        for i, mamba_layer in enumerate(self.mamba_layers):
-            if hasattr(self, 'layer_norms') and not self.mamba_available:
-                # 简化实现需要手动添加残差连接和归一化
-                residual = x
-                x = self.layer_norms[i](x)
-                x = mamba_layer(x)
-                x = residual + x
-            else:
-                x = mamba_layer(x)
+        # 通过Mamba层（S4实现）
+        for mamba_layer in self.mamba_layers:
+            x = mamba_layer(x)
         
         # 最终归一化
         if self.use_final_norm:
@@ -355,15 +353,11 @@ class MambaBranch(nn.Module):
 
 def create_mamba_branch(**kwargs) -> MambaBranch:
     """
-    创建Mamba分支的便捷函数，自动处理可用性检查
+    创建Mamba分支的便捷函数（现在使用S4实现）
     
     Returns:
-        MambaBranch实例
+        MambaBranch实例（S4实现）
     """
-    if not MAMBA_AVAILABLE:
-        print("注意: Mamba-SSM不可用，将使用回退实现")
-        kwargs['use_simple_fallback'] = kwargs.get('use_simple_fallback', False)
-    
     return MambaBranch(**kwargs)
 
 

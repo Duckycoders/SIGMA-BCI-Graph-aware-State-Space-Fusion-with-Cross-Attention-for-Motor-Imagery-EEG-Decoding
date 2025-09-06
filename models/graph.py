@@ -11,18 +11,16 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 import warnings
 
-# 尝试导入PyTorch Geometric
-try:
-    import torch_geometric
-    from torch_geometric.nn import GCNConv, GATConv, global_mean_pool, global_max_pool
-    from torch_geometric.data import Data, Batch
-    from torch_geometric.utils import to_dense_adj
-    TORCH_GEOMETRIC_AVAILABLE = True
-    print("PyTorch Geometric 成功导入")
-except ImportError as e:
-    print(f"警告: PyTorch Geometric 导入失败 - {e}")
-    print("图卷积功能将被禁用，使用简单的全连接层代替")
-    TORCH_GEOMETRIC_AVAILABLE = False
+# 导入PyTorch Geometric
+import torch_geometric
+from torch_geometric.nn import GCNConv, GATConv, global_mean_pool, global_max_pool
+from torch_geometric.data import Data, Batch
+from torch_geometric.utils import to_dense_adj
+import torch_scatter
+import torch_sparse
+
+TORCH_GEOMETRIC_AVAILABLE = True
+print("✓ PyTorch Geometric 完整功能可用")
 
 
 class SimpleGraphNet(nn.Module):
@@ -89,10 +87,7 @@ class EEGGraphNet(nn.Module):
         self.out_channels = out_channels
         self.use_global_pooling = use_global_pooling
         
-        if not TORCH_GEOMETRIC_AVAILABLE:
-            print("使用简化图网络（PyG不可用）")
-            self.graph_net = SimpleGraphNet(in_channels, hidden_channels, out_channels)
-            return
+        # PyTorch Geometric现在完全可用，不需要回退
         
         # 构建图结构
         self.edge_index = self._build_graph_structure()
@@ -176,8 +171,7 @@ class EEGGraphNet(nn.Module):
             图特征 (batch_size, out_channels) 如果use_global_pooling=True
             或 (batch_size, n_electrodes, out_channels) 如果use_global_pooling=False
         """
-        if not TORCH_GEOMETRIC_AVAILABLE:
-            return self.graph_net(x)
+        # 使用完整的PyTorch Geometric实现
         
         batch_size, n_electrodes, in_channels = x.shape
         
