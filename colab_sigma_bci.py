@@ -336,9 +336,14 @@ class RealDataSigmaBCI(torch.nn.Module):
         x_gamma = self.gamma_filter(x) # γ波频带
         
         # 通道平均后转为序列
-        x_mu_seq = x_mu.mean(dim=1).permute(0, 2, 1)     # (batch, time, 1)
-        x_beta_seq = x_beta.mean(dim=1).permute(0, 2, 1)
-        x_gamma_seq = x_gamma.mean(dim=1).permute(0, 2, 1)
+        x_mu_avg = x_mu.mean(dim=1)      # (batch, time)
+        x_beta_avg = x_beta.mean(dim=1)  # (batch, time)  
+        x_gamma_avg = x_gamma.mean(dim=1) # (batch, time)
+        
+        # 添加特征维度
+        x_mu_seq = x_mu_avg.unsqueeze(-1)     # (batch, time, 1)
+        x_beta_seq = x_beta_avg.unsqueeze(-1) # (batch, time, 1)
+        x_gamma_seq = x_gamma_avg.unsqueeze(-1) # (batch, time, 1)
         
         # 2. 双分支状态空间建模
         s4_mu = self.s4_branch(x_mu_seq)        # S4处理μ波
