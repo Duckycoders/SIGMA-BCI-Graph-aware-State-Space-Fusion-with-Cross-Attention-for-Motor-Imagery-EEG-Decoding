@@ -229,7 +229,7 @@ def load_real_bnci_data_fixed(data_dir, max_subjects=5):
             filepath = os.path.join(data_dir, filename)
             
             try:
-                    data = np.load(filepath, allow_pickle=True)
+                data = np.load(filepath, allow_pickle=True)
                 eeg_data = data['data']      # (22, samples)
                 events = data['events']      # (n_events, 3)
                 
@@ -598,7 +598,7 @@ def load_bnci_data_robust(data_dir, max_subjects=6):
             filepath = os.path.join(data_dir, filename)
             
             try:
-                    data = np.load(filepath, allow_pickle=True)
+                data = np.load(filepath, allow_pickle=True)
                 eeg_data = data['data']      # (22, samples)
                 events = data['events']      # (n_events, 3)
                 
