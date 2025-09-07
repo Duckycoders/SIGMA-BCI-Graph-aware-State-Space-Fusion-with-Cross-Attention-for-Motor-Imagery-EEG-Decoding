@@ -29,13 +29,17 @@ if os.path.exists('/content/BCI'):
 # ===== 2. 安装依赖 =====
 os.system('pip install pyyaml matplotlib seaborn tqdm scikit-learn')
 
-# ===== 3. 下载代码 =====
+# ===== 3. 下载代码（处理LFS问题）=====
 os.makedirs('/content/BCI', exist_ok=True)
 os.chdir('/content/BCI')
 
+# 下载代码，忽略LFS错误
 os.system('git clone https://github.com/Duckycoders/SIGMA-BCI-Graph-aware-State-Space-Fusion-with-Cross-Attention-for-Motor-Imagery-EEG-Decoding.git temp')
-os.system('cp -r temp/* .')
+os.system('cp -r temp/* . || true')  # 即使失败也继续
 os.system('rm -rf temp')
+
+# 检查实际下载的数据
+print("🔍 检查实际可用数据...")
 
 # 修复图卷积依赖
 with open('models/graph.py', 'w') as f:
@@ -530,10 +534,24 @@ elif len(unique_subjects) >= 2:
     print(f"  测试数据: {len(X_test)}")
     
 else:
-    print("单受试者数据：使用随机分割")
-    X_train_val, X_test, y_train_val, y_test = train_test_split(
-        trials, labels, test_size=0.3, stratify=labels, random_state=42
-    )
+    print("单受试者数据：使用Train/Test Session分割（更真实）")
+    
+    # 检查是否有session信息（通过文件名判断）
+    train_session_mask = np.array([False] * len(subjects))
+    test_session_mask = np.array([False] * len(subjects))
+    
+    # 这里我们需要重新加载数据以获取session信息
+    # 简化方案：前70%作为训练，后30%作为测试（模拟session分割）
+    n_total = len(trials)
+    train_end = int(0.7 * n_total)
+    
+    X_train_val = trials[:train_end]
+    y_train_val = labels[:train_end]
+    X_test = trials[train_end:]
+    y_test = labels[train_end:]
+    
+    print(f"模拟Session分割: 前70%训练，后30%测试")
+    print(f"  这模拟了真实BCI中的时间泛化能力")
 
 # 训练验证分割（确保数据充足）
 if len(X_train_val) >= 10:
@@ -581,7 +599,7 @@ criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.0)  # 移除标签平滑
 
 # 添加学习率调度器
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='max', factor=0.5, patience=3, verbose=True, min_lr=1e-5
+    optimizer, mode='max', factor=0.5, patience=3, min_lr=1e-5
 )
 
 print(f"📊 优化模型参数: {sum(p.numel() for p in model.parameters()):,}")
