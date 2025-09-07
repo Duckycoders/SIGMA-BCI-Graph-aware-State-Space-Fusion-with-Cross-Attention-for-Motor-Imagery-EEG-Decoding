@@ -22,24 +22,55 @@ except:
     print(f"🔧 设备: {device}")
     is_tpu = False
 
-# 清理环境
+# 智能清理：保留数据目录
+print("🔄 智能环境清理...")
 if os.path.exists('/content/BCI'):
+    # 备份数据目录
+    if os.path.exists('/content/BCI/data'):
+        print("💾 备份数据目录...")
+        if os.path.exists('/content/data_backup'):
+            shutil.rmtree('/content/data_backup')
+        shutil.move('/content/BCI/data', '/content/data_backup')
+        print("✅ 数据已备份到 /content/data_backup")
+    
+    # 删除其他文件
     shutil.rmtree('/content/BCI')
+    print("🗑️ 清理代码文件")
+else:
+    print("📁 首次运行，无需清理")
 
 # ===== 2. 安装依赖 =====
 os.system('pip install pyyaml matplotlib seaborn tqdm scikit-learn')
 
-# ===== 3. 下载代码（处理LFS问题）=====
+# ===== 3. 重建项目结构 =====
 os.makedirs('/content/BCI', exist_ok=True)
 os.chdir('/content/BCI')
 
-# 下载代码，忽略LFS错误
-os.system('git clone https://github.com/Duckycoders/SIGMA-BCI-Graph-aware-State-Space-Fusion-with-Cross-Attention-for-Motor-Imagery-EEG-Decoding.git temp')
-os.system('cp -r temp/* . || true')  # 即使失败也继续
-os.system('rm -rf temp')
+# 恢复数据目录
+if os.path.exists('/content/data_backup'):
+    print("📂 恢复数据目录...")
+    shutil.move('/content/data_backup', '/content/BCI/data')
+    print("✅ 数据目录已恢复")
+else:
+    print("📁 首次运行，请手动上传数据到 /content/BCI/data/bnci/bnci2014_001/")
+    os.makedirs('/content/BCI/data/bnci/bnci2014_001', exist_ok=True)
 
-# 检查实际下载的数据
-print("🔍 检查实际可用数据...")
+# 创建必要的目录结构
+os.makedirs('/content/BCI/models', exist_ok=True)
+os.makedirs('/content/BCI/configs', exist_ok=True)
+os.makedirs('/content/BCI/checkpoints', exist_ok=True)
+
+# 检查数据状态
+print("🔍 检查数据状态...")
+if os.path.exists('/content/BCI/data/bnci/bnci2014_001'):
+    npz_files = [f for f in os.listdir('/content/BCI/data/bnci/bnci2014_001') if f.endswith('.npz')]
+    if npz_files:
+        available_subjects = sorted(set([int(f[1:3]) for f in npz_files if f.startswith('S')]))
+        print(f"✅ 发现数据: {len(npz_files)}个文件，受试者{available_subjects}")
+    else:
+        print("⚠️  数据目录为空，请上传NPZ文件")
+else:
+    print("⚠️  数据目录不存在，请手动创建并上传文件")
 
 # 修复图卷积依赖
 with open('models/graph.py', 'w') as f:
@@ -64,7 +95,29 @@ def create_electrode_graph(electrode_names, graph_type='standard'):
 
 print("✅ 环境准备完成")
 
-# ===== 4. 修复的数据加载函数 =====
+# ===== 4. 数据状态检查 =====
+print("\n🔍 检查手动上传的数据...")
+
+data_dir = '/content/BCI/data/bnci/bnci2014_001'
+if os.path.exists(data_dir):
+    npz_files = [f for f in os.listdir(data_dir) if f.endswith('.npz')]
+    
+    if len(npz_files) >= 12:
+        available_subjects = sorted(set([int(f[1:3]) for f in npz_files if f.startswith('S')]))
+        print(f"✅ 发现手动上传数据: {len(npz_files)}个文件")
+        print(f"✅ 可用受试者: {available_subjects}")
+        print(f"🎯 将使用这些数据进行SIGMA-BCI训练")
+    else:
+        print("⚠️  数据不足，请上传更多NPZ文件")
+        print(f"当前文件数: {len(npz_files)}")
+        if npz_files:
+            print(f"已有文件: {npz_files[:5]}...")
+else:
+    print("❌ 请先手动上传数据到指定目录")
+    print("📋 上传路径: /content/BCI/data/bnci/bnci2014_001/")
+    print("📋 文件格式: S01_0train_0.npz, S01_0train_1.npz, ...")
+
+# ===== 5. 修复的数据加载函数 =====
 def load_real_bnci_data_fixed(data_dir, max_subjects=5):
     """修复版：加载多个受试者的真实BNCI数据"""
     all_trials = []
