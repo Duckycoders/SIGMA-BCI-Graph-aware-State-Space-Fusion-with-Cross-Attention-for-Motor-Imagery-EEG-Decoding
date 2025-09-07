@@ -227,25 +227,17 @@ class RealDataSigmaBCI(torch.nn.Module):
         self.beta_filter = torch.nn.Conv1d(22, 22, 15, padding=7, groups=22)    # β波 15-30Hz
         self.gamma_filter = torch.nn.Conv1d(22, 22, 7, padding=3, groups=22)    # γ波 30-45Hz
         
-        # 2. 增强S4分支（更大容量）
+        # 2. 简化S4分支（减少复杂性，提升学习能力）
         self.s4_branch = torch.nn.Sequential(
             torch.nn.Linear(1, 64),
-            torch.nn.LayerNorm(64),
-            torch.nn.GELU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(64, 64),
             torch.nn.LayerNorm(64),
             torch.nn.GELU(),
             torch.nn.Linear(64, 64)
         )
         
-        # 3. 增强Mamba分支
+        # 3. 简化Mamba分支
         self.mamba_branch = torch.nn.Sequential(
             torch.nn.Linear(1, 64),
-            torch.nn.LayerNorm(64),
-            torch.nn.SiLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(64, 64),
             torch.nn.LayerNorm(64),
             torch.nn.SiLU(),
             torch.nn.Linear(64, 64)
@@ -266,30 +258,26 @@ class RealDataSigmaBCI(torch.nn.Module):
             torch.nn.Linear(64, 32)
         )
         
-        # 6. 改进MoE（4个专业化专家）
+        # 6. 简化MoE（4个轻量专家）
         self.expert_spatial = torch.nn.Sequential(
-            torch.nn.Linear(64, 128),
+            torch.nn.Linear(64, 64),
             torch.nn.GELU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(128, 64)
+            torch.nn.Linear(64, 64)
         )
         self.expert_temporal = torch.nn.Sequential(
-            torch.nn.Linear(64, 128),
+            torch.nn.Linear(64, 64),
             torch.nn.Tanh(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(128, 64)
+            torch.nn.Linear(64, 64)
         )
         self.expert_frequency = torch.nn.Sequential(
-            torch.nn.Linear(64, 128),
+            torch.nn.Linear(64, 64),
             torch.nn.ReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(128, 64)
+            torch.nn.Linear(64, 64)
         )
         self.expert_mixed = torch.nn.Sequential(
-            torch.nn.Linear(64, 128),
+            torch.nn.Linear(64, 64),
             torch.nn.SiLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(128, 64)
+            torch.nn.Linear(64, 64)
         )
         
         self.router = torch.nn.Sequential(
@@ -373,16 +361,11 @@ class RealDataSigmaBCI(torch.nn.Module):
             self.expert_mixed(pooled)
         ]
         
-        # Top-2专家组合
-        top2_weights, top2_indices = torch.topk(router_weights, k=2, dim=-1)
-        top2_weights = torch.softmax(top2_weights, dim=-1)
-        
-        moe_out = torch.zeros_like(pooled)
-        for i in range(2):  # Top-2
-            for batch_idx in range(batch_size):
-                expert_idx = top2_indices[batch_idx, i].item()
-                weight = top2_weights[batch_idx, i]
-                moe_out[batch_idx] += weight * expert_outputs[expert_idx][batch_idx]
+        # 简化MoE：直接加权组合所有专家（避免复杂的Top-K逻辑）
+        moe_out = (router_weights[:, 0:1] * expert_outputs[0] + 
+                  router_weights[:, 1:2] * expert_outputs[1] +
+                  router_weights[:, 2:3] * expert_outputs[2] + 
+                  router_weights[:, 3:4] * expert_outputs[3])
         
         # 5. Riemann
         riemann_feat = self.riemann_branch(self.compute_riemann(x))
@@ -457,13 +440,18 @@ def load_bnci_data_robust(data_dir, max_subjects=6):
                     if event_type in [1, 2, 3, 4]:
                         end_sample = start_sample + trial_length
                         
-                        if end_sample <= eeg_data.shape[1]:
-                            trial = eeg_data[:, start_sample:end_sample]
-                            all_trials.append(trial)
-                            all_labels.append(event_type - 1)
-                            all_subjects.append(subject_id)
-                            file_trials += 1
-                            subject_trial_count += 1
+                            if end_sample <= eeg_data.shape[1]:
+                                trial = eeg_data[:, start_sample:end_sample]
+                                
+                                # 重要：数据标准化
+                                trial = trial - trial.mean(axis=1, keepdims=True)  # 去均值
+                                trial = trial / (trial.std(axis=1, keepdims=True) + 1e-8)  # 标准化
+                                
+                                all_trials.append(trial)
+                                all_labels.append(event_type - 1)
+                                all_subjects.append(subject_id)
+                                file_trials += 1
+                                subject_trial_count += 1
                 
                 print(f"    {filename}: 提取{file_trials}个试次")
                 
@@ -588,16 +576,34 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 model = RealDataSigmaBCI()
 model = model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)  # 降低学习率
-criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)  # 添加标签平滑
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-5)  # 提高学习率，降低正则化
+criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.0)  # 移除标签平滑，让模型更容易学习
 
-print(f"📊 增强模型参数: {sum(p.numel() for p in model.parameters()):,}")
+# 添加学习率调度器
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='max', factor=0.5, patience=3, verbose=True, min_lr=1e-5
+)
+
+print(f"📊 优化模型参数: {sum(p.numel() for p in model.parameters()):,}")
+
+# 权重初始化（重要！）
+def init_weights(m):
+    if isinstance(m, torch.nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight, gain=1.0)
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+    elif isinstance(m, torch.nn.Conv1d):
+        torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+model.apply(init_weights)
+print("✅ 模型权重重新初始化")
 
 # 训练
-print(f"\n🚀 开始在真实BNCI数据上训练（改进版）...")
+print(f"\n🚀 开始优化训练（修复学习问题）...")
 
 train_losses = []
 val_accs = []
+best_val_acc = 0.0
 
 for epoch in range(8):  # 增加训练轮数
     model.train()
@@ -613,6 +619,9 @@ for epoch in range(8):  # 增加训练轮数
         loss = criterion(outputs['logits'], batch_y)
         
         loss.backward()
+        
+        # 添加梯度裁剪防止梯度爆炸
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         if is_tpu:
             xm.optimizer_step(optimizer)
@@ -646,10 +655,32 @@ for epoch in range(8):  # 增加训练轮数
     
     print(f"  Epoch {epoch+1}: Loss={avg_loss:.4f}, Train={train_acc:.4f}, Val={val_acc:.4f}")
     
+    # 学习率调度
+    old_lr = optimizer.param_groups[0]['lr']
+    scheduler.step(val_acc)
+    new_lr = optimizer.param_groups[0]['lr']
+    if new_lr != old_lr:
+        print(f"    📉 学习率调整: {old_lr:.2e} → {new_lr:.2e}")
+    
+    # 保存最佳模型
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        print(f"    💾 保存最佳模型 (Val Acc: {val_acc:.4f})")
+    
+    # 诊断信息
+    if epoch == 0:
+        print(f"    🔍 首轮诊断: 预测分布 {torch.bincount(torch.argmax(outputs['logits'], dim=1)).float() / len(batch_y)}")
+    
     # 早停机制
-    if val_acc > 0.6:  # 如果验证准确率超过60%就提前停止
+    if val_acc > 0.6:
         print(f"  ✅ 验证准确率超过60%，提前停止训练")
         break
+    
+    # 如果学习困难，给出提示
+    if epoch >= 3 and val_acc <= 0.3:
+        print(f"  ⚠️  学习困难，可能需要调整架构或数据")
+        if epoch >= 5:
+            break
 
 # 最终测试
 print(f"\n📊 最终测试...")
@@ -794,18 +825,18 @@ results_summary = {
     'model_architecture': 'SIGMA-BCI',
     'evaluation_type': '6-Subject LOSO',
     'data_source': 'Real BNCI2014-001 (S01-S06)',
-    'total_subjects': len(unique_subjects),
-    'total_trials': len(trials),
-    'train_subjects': sorted([s for s in unique_subjects if s != test_subject]),
-    'test_subject': test_subject,
-    'test_trials': len(X_test),
-    'loso_accuracy': test_acc,
-    'cohen_kappa': kappa,
-    'class_accuracies': class_accs.tolist(),
-    'model_parameters': sum(p.numel() for p in model.parameters()),
-    'training_epochs': len(train_losses),
-    'best_val_accuracy': max(val_accs) if val_accs else 0,
-    'expert_usage': expert_usage.tolist() if all_moe_weights else None,
+    'total_subjects': int(len(unique_subjects)),
+    'total_trials': int(len(trials)),
+    'train_subjects': [int(s) for s in unique_subjects if s != test_subject],
+    'test_subject': int(test_subject),
+    'test_trials': int(len(X_test)),
+    'loso_accuracy': float(test_acc),
+    'cohen_kappa': float(kappa),
+    'class_accuracies': [float(acc) for acc in class_accs],
+    'model_parameters': int(sum(p.numel() for p in model.parameters())),
+    'training_epochs': int(len(train_losses)),
+    'best_val_accuracy': float(max(val_accs)) if val_accs else 0.0,
+    'expert_usage': [float(u) for u in expert_usage] if all_moe_weights else None,
     'components': {
         'filterbank_bands': 3,
         'state_space_branches': 2,
