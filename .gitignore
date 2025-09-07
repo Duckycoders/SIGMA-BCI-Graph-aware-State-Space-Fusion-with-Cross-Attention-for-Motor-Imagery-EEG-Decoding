@@ -69,8 +69,8 @@ checkpoints/**/
 !checkpoints/
 !checkpoints/**/.gitkeep
 
-# Large data files
-*.npz
+# Large data files (using Git LFS for BNCI data)
+# *.npz  # Commented out to allow BNCI data upload
 *.npy
 *.h5
 *.hdf5
