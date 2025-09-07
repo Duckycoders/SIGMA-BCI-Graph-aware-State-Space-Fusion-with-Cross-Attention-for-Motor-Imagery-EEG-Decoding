@@ -502,9 +502,26 @@ print(f"\n📊 数据分割策略 (受试者: {unique_subjects})...")
 subject_trial_counts = [(s, np.sum(subjects == s)) for s in unique_subjects]
 print(f"每个受试者试次数: {subject_trial_counts}")
 
-if len(unique_subjects) >= 2:
-    # 选择数据最多的受试者作为测试
-    test_subject = max(subject_trial_counts, key=lambda x: x[1])[0]
+if len(unique_subjects) >= 3:
+    # 真正的LOSO：受试者1作为测试，其他受试者训练
+    test_subject = 1  # 固定使用受试者1作为测试
+    
+    test_mask = subjects == test_subject
+    train_val_mask = ~test_mask
+    
+    X_test = trials[test_mask]
+    y_test = labels[test_mask]
+    X_train_val = trials[train_val_mask]
+    y_train_val = labels[train_val_mask]
+    
+    print(f"✅ 真正的LOSO分割: 测试受试者={test_subject}")
+    print(f"  训练受试者: {sorted([s for s in unique_subjects if s != test_subject])}")
+    print(f"  训练+验证数据: {len(X_train_val)} 试次")
+    print(f"  测试数据: {len(X_test)} 试次")
+    
+elif len(unique_subjects) >= 2:
+    # 至少2个受试者：选择一个作为测试
+    test_subject = unique_subjects[0]
     
     test_mask = subjects == test_subject
     train_val_mask = ~test_mask
@@ -517,13 +534,6 @@ if len(unique_subjects) >= 2:
     print(f"跨受试者分割: 测试受试者={test_subject}")
     print(f"  训练+验证数据: {len(X_train_val)}")
     print(f"  测试数据: {len(X_test)}")
-    
-    # 检查训练数据是否足够
-    if len(X_train_val) < 20:
-        print("⚠️  跨受试者训练数据太少，改用随机分割")
-        X_train_val, X_test, y_train_val, y_test = train_test_split(
-            trials, labels, test_size=0.3, stratify=labels, random_state=42
-        )
     
 else:
     print("单受试者数据：使用随机分割")
