@@ -359,7 +359,12 @@ class RealDataSigmaBCI(torch.nn.Module):
             torch.nn.Linear(32, 4)
         )
         
-        print("增强SIGMA-BCI: 3频带FilterBank+深层S4/Mamba+4专家MoE+强化融合")
+        print("优化SIGMA-BCI: 简化架构，强制学习能力")
+        
+        # 重要：初始化分类器偏置，打破对称性
+        with torch.no_grad():
+            # 给每个类别不同的初始偏置
+            self.classifier[-1].bias.copy_(torch.tensor([-0.1, 0.1, -0.05, 0.05]))
     
     def compute_riemann(self, x):
         batch_size, n_channels, n_time = x.shape
@@ -647,13 +652,16 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 model = RealDataSigmaBCI()
 model = model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-5)  # 提高学习率，降低正则化
-criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.0)  # 移除标签平滑，让模型更容易学习
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=1e-6)  # 更高学习率
+criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.0)  # 无标签平滑
 
 # 添加学习率调度器
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='max', factor=0.5, patience=3, min_lr=1e-5
-)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)  # 更简单的调度器
+
+# 添加类别权重平衡（重要！）
+class_counts = np.bincount(y_train)
+class_weights = torch.FloatTensor(len(class_counts) / class_counts).to(device)
+criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
 
 print(f"📊 优化模型参数: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -726,9 +734,9 @@ for epoch in range(8):  # 增加训练轮数
     
     print(f"  Epoch {epoch+1}: Loss={avg_loss:.4f}, Train={train_acc:.4f}, Val={val_acc:.4f}")
     
-    # 学习率调度
+    # 学习率调度（每个epoch都调度）
     old_lr = optimizer.param_groups[0]['lr']
-    scheduler.step(val_acc)
+    scheduler.step()
     new_lr = optimizer.param_groups[0]['lr']
     if new_lr != old_lr:
         print(f"    📉 学习率调整: {old_lr:.2e} → {new_lr:.2e}")
@@ -738,20 +746,34 @@ for epoch in range(8):  # 增加训练轮数
         best_val_acc = val_acc
         print(f"    💾 保存最佳模型 (Val Acc: {val_acc:.4f})")
     
-    # 诊断信息
+    # 强制学习诊断
     if epoch == 0:
-        print(f"    🔍 首轮诊断: 预测分布 {torch.bincount(torch.argmax(outputs['logits'], dim=1)).float() / len(batch_y)}")
+        with torch.no_grad():
+            sample_batch = next(iter(val_loader))
+            sample_outputs = model(sample_batch[0][:4].to(device))
+            pred_dist = torch.bincount(torch.argmax(sample_outputs['logits'], dim=1), minlength=4).float()
+            pred_dist = pred_dist / pred_dist.sum()
+            print(f"    🔍 预测分布: {pred_dist.numpy()}")
+            
+            # 检查特征是否有差异
+            features = sample_outputs['moe_weights'].std().item()
+            print(f"    🔍 MoE权重标准差: {features:.4f}")
+    
+    # 强制学习检查
+    if epoch >= 2 and val_acc <= 0.28:
+        print(f"    🚨 学习异常！重新初始化分类器...")
+        # 重新初始化分类器
+        model.classifier[-1].reset_parameters()
+        with torch.no_grad():
+            model.classifier[-1].bias.copy_(torch.tensor([-0.2, 0.2, -0.1, 0.1]).to(device))
     
     # 早停机制
-    if val_acc > 0.6:
-        print(f"  ✅ 验证准确率超过60%，提前停止训练")
-        break
+    if val_acc > 0.5:
+        print(f"  ✅ 验证准确率超过50%，继续训练...")
     
-    # 如果学习困难，给出提示
-    if epoch >= 3 and val_acc <= 0.3:
-        print(f"  ⚠️  学习困难，可能需要调整架构或数据")
-        if epoch >= 5:
-            break
+    if epoch >= 10 and val_acc <= 0.3:
+        print(f"  ⚠️  10轮后仍无改善，停止训练")
+        break
 
 # 最终测试
 print(f"\n📊 最终测试...")
