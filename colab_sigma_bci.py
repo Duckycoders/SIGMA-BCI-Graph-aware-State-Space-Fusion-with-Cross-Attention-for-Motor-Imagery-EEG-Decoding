@@ -440,18 +440,18 @@ def load_bnci_data_robust(data_dir, max_subjects=6):
                     if event_type in [1, 2, 3, 4]:
                         end_sample = start_sample + trial_length
                         
-                            if end_sample <= eeg_data.shape[1]:
-                                trial = eeg_data[:, start_sample:end_sample]
-                                
-                                # 重要：数据标准化
-                                trial = trial - trial.mean(axis=1, keepdims=True)  # 去均值
-                                trial = trial / (trial.std(axis=1, keepdims=True) + 1e-8)  # 标准化
-                                
-                                all_trials.append(trial)
-                                all_labels.append(event_type - 1)
-                                all_subjects.append(subject_id)
-                                file_trials += 1
-                                subject_trial_count += 1
+                        if end_sample <= eeg_data.shape[1]:
+                            trial = eeg_data[:, start_sample:end_sample]
+                            
+                            # 重要：数据标准化
+                            trial = trial - trial.mean(axis=1, keepdims=True)  # 去均值
+                            trial = trial / (trial.std(axis=1, keepdims=True) + 1e-8)  # 标准化
+                            
+                            all_trials.append(trial)
+                            all_labels.append(event_type - 1)
+                            all_subjects.append(subject_id)
+                            file_trials += 1
+                            subject_trial_count += 1
                 
                 print(f"    {filename}: 提取{file_trials}个试次")
                 
