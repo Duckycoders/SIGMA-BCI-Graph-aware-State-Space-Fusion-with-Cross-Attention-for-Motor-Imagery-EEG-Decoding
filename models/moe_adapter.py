@@ -12,61 +12,155 @@ from typing import Dict, List, Optional, Tuple, Union
 import math
 
 
-class Expert(nn.Module):
-    """单个专家网络"""
+class TransformerExpert(nn.Module):
+    """Transformer专家：具有自注意力机制的专家"""
+    
+    def __init__(self,
+                 d_model: int,
+                 n_heads: int = 4,
+                 d_ff: int = None,
+                 dropout: float = 0.1,
+                 expert_type: str = 'spatial'):
+        """
+        Args:
+            d_model: 模型维度
+            n_heads: 注意力头数
+            d_ff: 前馈网络维度
+            dropout: Dropout概率
+            expert_type: 专家类型 ('spatial', 'temporal', 'frequency', 'mixed')
+        """
+        super().__init__()
+        
+        self.d_model = d_model
+        self.expert_type = expert_type
+        
+        if d_ff is None:
+            d_ff = d_model * 4
+        
+        # 多头自注意力
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # 前馈网络
+        self.feed_forward = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # 归一化层
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # 专家特化层（根据专家类型）
+        if expert_type == 'spatial':
+            # 空间专家：关注通道间关系
+            self.specialization = nn.Conv1d(d_model, d_model, 1)
+        elif expert_type == 'temporal':
+            # 时间专家：关注时序模式
+            self.specialization = nn.Conv1d(d_model, d_model, 3, padding=1)
+        elif expert_type == 'frequency':
+            # 频率专家：关注频域特征
+            self.specialization = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.Tanh(),  # 频域特化激活
+                nn.Linear(d_model, d_model)
+            )
+        else:
+            # 混合专家
+            self.specialization = nn.Identity()
+        
+        print(f"Transformer专家初始化 ({expert_type}): {d_model}维度, {n_heads}头")
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, d_model) 或 (batch, d_model)
+        Returns:
+            专家输出
+        """
+        # 如果输入是2D，扩展为序列
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (batch, 1, d_model)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        # 自注意力模块
+        residual = x
+        x_norm = self.norm1(x)
+        attn_output, _ = self.self_attention(x_norm, x_norm, x_norm)
+        x = residual + attn_output
+        
+        # 前馈网络
+        residual = x
+        x_norm = self.norm2(x)
+        ff_output = self.feed_forward(x_norm)
+        x = residual + ff_output
+        
+        # 专家特化处理
+        if self.expert_type in ['spatial', 'temporal']:
+            # 卷积特化
+            x_conv = self.specialization(x.transpose(-1, -2)).transpose(-1, -2)
+            x = x + x_conv
+        elif self.expert_type == 'frequency':
+            # 频域特化
+            x_spec = self.specialization(x)
+            x = x + x_spec
+        
+        # 如果原本是2D输入，压缩回去
+        if squeeze_output:
+            x = x.squeeze(1)
+        
+        return x
+
+
+class MLPExpert(nn.Module):
+    """传统MLP专家（保持兼容性）"""
     
     def __init__(self,
                  d_input: int,
                  d_hidden: int,
                  d_output: int,
                  dropout: float = 0.1,
-                 activation: str = 'relu'):
-        """
-        初始化专家网络
-        
-        Args:
-            d_input: 输入维度
-            d_hidden: 隐层维度
-            d_output: 输出维度
-            dropout: Dropout概率
-            activation: 激活函数类型
-        """
+                 activation: str = 'gelu'):
         super().__init__()
         
-        # 激活函数选择
-        if activation == 'relu':
-            act_fn = nn.ReLU()
-        elif activation == 'gelu':
-            act_fn = nn.GELU()
-        elif activation == 'swish':
-            act_fn = nn.SiLU()
-        else:
-            act_fn = nn.ReLU()
+        act_fn = nn.GELU() if activation == 'gelu' else nn.ReLU()
         
-        # 专家网络结构
         self.network = nn.Sequential(
             nn.Linear(d_input, d_hidden),
+            nn.LayerNorm(d_hidden),
             act_fn,
             nn.Dropout(dropout),
-            nn.Linear(d_hidden, d_output),
-            nn.Dropout(dropout)
+            nn.Linear(d_hidden, d_hidden),
+            nn.LayerNorm(d_hidden),
+            act_fn,
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden, d_output)
         )
         
-        # 初始化权重
         self._init_weights()
     
     def _init_weights(self):
-        """初始化网络权重"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                # Xavier初始化
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """前向传播"""
         return self.network(x)
+
+
+# 为了兼容性，保留原名
+Expert = MLPExpert
 
 
 class Router(nn.Module):
@@ -95,19 +189,33 @@ class Router(nn.Module):
         self.noisy_gating = noisy_gating
         self.noise_epsilon = noise_epsilon
         
-        # 门控网络
-        self.gate = nn.Linear(d_input, n_experts, bias=False)
+        # 改进的门控网络（更复杂的路由决策）
+        self.gate = nn.Sequential(
+            nn.Linear(d_input, d_input // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_input // 2, n_experts),
+        )
         
         # 噪声网络（用于训练时的探索）
         if noisy_gating:
             self.noise_gate = nn.Linear(d_input, n_experts, bias=False)
+        
+        # 专家重要性权重（可学习）
+        self.expert_importance = nn.Parameter(torch.ones(n_experts))
         
         # 初始化
         self._init_weights()
     
     def _init_weights(self):
         """初始化权重"""
-        nn.init.xavier_uniform_(self.gate.weight)
+        # 初始化门控网络的权重
+        for module in self.gate.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
         if self.noisy_gating:
             nn.init.xavier_uniform_(self.noise_gate.weight)
     
@@ -142,8 +250,9 @@ class Router(nn.Module):
         original_shape = x.shape
         x_flat = x.view(-1, x.shape[-1])  # (batch * ..., d_input)
         
-        # 计算门控值
+        # 计算门控值，加入专家重要性权重
         clean_logits = self.gate(x_flat)  # (batch * ..., n_experts)
+        clean_logits = clean_logits + self.expert_importance.unsqueeze(0)  # 专家重要性偏置
         
         if self.noisy_gating and self.training:
             # 添加噪声用于探索
@@ -182,18 +291,20 @@ class Router(nn.Module):
         return top_k_gates, top_k_indices, aux_loss_info
 
 
-class MoEAdapter(nn.Module):
-    """MoE Adapter：混合专家适配器"""
+class EnhancedMoEAdapter(nn.Module):
+    """增强的MoE Adapter：支持Transformer专家"""
     
     def __init__(self,
                  d_input: int,
                  d_output: int,
-                 n_experts: int = 4,
+                 n_experts: int = 8,
                  expert_hidden_dim: int = None,
                  top_k: int = 2,
                  dropout: float = 0.1,
                  load_balance_weight: float = 0.01,
-                 noisy_gating: bool = True):
+                 noisy_gating: bool = True,
+                 use_transformer_experts: bool = True,
+                 transformer_ratio: float = 0.5):
         """
         初始化MoE Adapter
         
@@ -227,16 +338,34 @@ class MoEAdapter(nn.Module):
             noisy_gating=noisy_gating
         )
         
-        # 专家网络
-        self.experts = nn.ModuleList([
-            Expert(
-                d_input=d_input,
-                d_hidden=expert_hidden_dim,
-                d_output=d_output,
-                dropout=dropout
+        # 专业化专家网络：每个专家有不同的特长
+        self.experts = nn.ModuleList()
+        
+        expert_configs = [
+            {'type': 'spatial', 'activation': 'gelu'},      # 空间模式专家
+            {'type': 'temporal', 'activation': 'swish'},    # 时间模式专家  
+            {'type': 'frequency', 'activation': 'relu'},    # 频率模式专家
+            {'type': 'mixed', 'activation': 'gelu'},        # 混合模式专家
+        ]
+        
+        for i in range(n_experts):
+            config = expert_configs[i % len(expert_configs)]
+            
+            # 根据专家ID选择不同的隐层大小，增加多样性
+            expert_hidden = expert_hidden_dim + (i - n_experts//2) * 32
+            expert_hidden = max(expert_hidden, d_input)  # 确保不小于输入维度
+            
+            self.experts.append(
+                MLPExpert(
+                    d_input=d_input,
+                    d_hidden=expert_hidden,
+                    d_output=d_output,
+                    dropout=dropout,
+                    activation=config['activation']
+                )
             )
-            for _ in range(n_experts)
-        ])
+        
+        print(f"MoE专家配置: {n_experts}个专业化专家，不同激活函数和隐层大小")
         
         # 残差连接
         if d_input == d_output:
@@ -474,4 +603,8 @@ if __name__ == "__main__":
     print(f"多维输出形状: {result_multi['output'].shape}")
     
     print("MoE Adapter测试完成!")
+
+
+# 在文件末尾添加别名（确保类已定义）
+MoEAdapter = EnhancedMoEAdapter
 

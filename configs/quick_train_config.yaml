@@ -30,10 +30,10 @@ model:
   fusion_method: 'cross_attention'
   fusion_n_heads: 4
   
-  # MoE配置 - 简化
+  # MoE配置 - 优化设置
   use_moe: true
-  moe_n_experts: 2   # 减少专家数
-  moe_top_k: 1
+  moe_n_experts: 8   # 增加专家数，提升专业化能力
+  moe_top_k: 2       # 允许组合多个专家
   
   # Riemann分支配置
   use_riemann_branch: true
