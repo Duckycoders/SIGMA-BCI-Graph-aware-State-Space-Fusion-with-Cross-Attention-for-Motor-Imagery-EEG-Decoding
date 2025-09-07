@@ -11,43 +11,99 @@ print("🔥 完整SIGMA-BCI Colab训练")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"设备: {device}")
 
-# 智能环境设置：适配Colab和本地环境
-print("🔄 环境设置...")
-if '/content' in os.getcwd() or os.path.exists('/content'):
-    # Colab环境
-    print("📍 检测到Colab环境")
+# ===== 智能环境检测和路径配置 =====
+def detect_environment():
+    """智能检测运行环境并返回相应配置"""
+    
+    # 检测方法1：检查是否有Colab特有的模块
+    try:
+        import google.colab
+        return 'colab'
+    except ImportError:
+        pass
+    
+    # 检测方法2：检查环境变量
+    if 'COLAB_GPU' in os.environ or 'COLAB_TPU_ADDR' in os.environ:
+        return 'colab'
+    
+    # 检测方法3：检查是否在Google Colab的工作目录
+    if '/content' in os.getcwd():
+        return 'colab'
+    
+    # 检测方法4：检查是否存在/content目录且在Linux系统（更精确的Colab检测）
+    if os.path.exists('/content') and os.name == 'posix' and 'google.colab' in str(os.environ):
+        return 'colab'
+    
+    # 默认为本地环境
+    return 'local'
+
+def get_paths(env_type):
+    """根据环境类型返回相应的路径配置"""
+    if env_type == 'colab':
+        return {
+            'data_dir': '/content/BCI/data/bnci/bnci2014_001',
+            'project_dir': '/content/BCI',
+            'backup_dir': '/content/data_backup',
+            'model_save_path': '/content/BCI/best_sigma_bci.pth'
+        }
+    else:  # local
+        return {
+            'data_dir': 'data/bnci/bnci2014_001',
+            'project_dir': '.',
+            'backup_dir': './data_backup',
+            'model_save_path': 'best_sigma_bci.pth'
+        }
+
+# 环境检测
+env_type = detect_environment()
+paths = get_paths(env_type)
+
+print("🔄 智能环境检测...")
+print(f"📍 检测到环境: {env_type.upper()}")
+print(f"📂 数据目录: {paths['data_dir']}")
+print(f"💾 模型保存路径: {paths['model_save_path']}")
+
+# 环境设置
+if env_type == 'colab':
+    # Colab环境设置
     if os.path.exists('/content/BCI'):
         # 备份数据目录
         if os.path.exists('/content/BCI/data'):
             print("💾 备份数据目录...")
-            if os.path.exists('/content/data_backup'):
-                shutil.rmtree('/content/data_backup')
-            shutil.move('/content/BCI/data', '/content/data_backup')
-            print("✅ 数据已备份到 /content/data_backup")
+            if os.path.exists(paths['backup_dir']):
+                shutil.rmtree(paths['backup_dir'])
+            shutil.move('/content/BCI/data', paths['backup_dir'])
+            print("✅ 数据已备份")
         
         # 删除其他文件
         shutil.rmtree('/content/BCI')
         print("🗑️ 清理代码文件")
     
     # 创建项目结构
-    os.makedirs('/content/BCI', exist_ok=True)
-    os.chdir('/content/BCI')
+    os.makedirs(paths['project_dir'], exist_ok=True)
+    os.chdir(paths['project_dir'])
     
     # 恢复数据目录
-    if os.path.exists('/content/data_backup'):
+    if os.path.exists(paths['backup_dir']):
         print("📂 恢复数据目录...")
-        shutil.move('/content/data_backup', '/content/BCI/data')
+        shutil.move(paths['backup_dir'], '/content/BCI/data')
         print("✅ 数据目录已恢复")
     else:
-        print("📁 首次运行，请手动上传数据到 /content/BCI/data/bnci/bnci2014_001/")
-        os.makedirs('/content/BCI/data/bnci/bnci2014_001', exist_ok=True)
+        print("📁 首次运行，请手动上传数据")
+        os.makedirs(paths['data_dir'], exist_ok=True)
 else:
-    # 本地环境
-    print("📍 检测到本地环境")
-    if not os.path.exists('data/bnci/bnci2014_001'):
-        print("❌ 请确保数据目录存在: data/bnci/bnci2014_001/")
+    # 本地环境设置
+    if not os.path.exists(paths['data_dir']):
+        print(f"❌ 请确保数据目录存在: {paths['data_dir']}")
+        print("   数据目录结构应该是:")
+        print("   data/bnci/bnci2014_001/")
+        print("   ├── S01_0train_0.npz")
+        print("   ├── S01_0train_1.npz")
+        print("   └── ...")
     else:
-        print("✅ 数据目录已找到")
+        # 检查数据文件
+        npz_files = [f for f in os.listdir(paths['data_dir']) if f.endswith('.npz')]
+        print(f"✅ 数据目录已找到，包含 {len(npz_files)} 个文件")
 
 print("✅ 环境准备完成")
 
@@ -66,12 +122,14 @@ def professional_eeg_preprocessing(trial, sfreq=250.0):
     for ch in range(trial.shape[0]):
         filtered_trial[ch, :] = signal.filtfilt(b, a, trial[ch, :])
     
-    # 2. 工频陷波 (50Hz)
-    notch_freq = 50.0 / nyquist
-    b_notch, a_notch = signal.iirnotch(notch_freq, Q=30)
-    
-    for ch in range(filtered_trial.shape[0]):
-        filtered_trial[ch, :] = signal.filtfilt(b_notch, a_notch, filtered_trial[ch, :])
+    # 2. 工频陷波 (50Hz及谐波)
+    for notch_freq in [50.0, 100.0]:  # 50Hz和100Hz
+        if notch_freq < sfreq / 2:
+            notch_normalized = notch_freq / nyquist
+            b_notch, a_notch = signal.iirnotch(notch_normalized, Q=30)
+            
+            for ch in range(filtered_trial.shape[0]):
+                filtered_trial[ch, :] = signal.filtfilt(b_notch, a_notch, filtered_trial[ch, :])
     
     # 3. 基线校正
     baseline_samples = int(0.5 * sfreq)
@@ -83,13 +141,30 @@ def professional_eeg_preprocessing(trial, sfreq=250.0):
     car = filtered_trial.mean(axis=0, keepdims=True)
     filtered_trial = filtered_trial - car
     
-    # 5. 标准化
+    # 5. 指数移动标准化 (Braindecode标准)
+    factor_new = 1e-3
     for ch in range(filtered_trial.shape[0]):
         ch_data = filtered_trial[ch, :]
-        ch_mean = ch_data.mean()
-        ch_std = ch_data.std()
-        if ch_std > 1e-8:
-            filtered_trial[ch, :] = (ch_data - ch_mean) / ch_std
+        
+        # 指数移动均值和方差
+        running_mean = 0
+        running_var = 1
+        
+        standardized = np.zeros_like(ch_data)
+        for i, sample in enumerate(ch_data):
+            running_mean = (1 - factor_new) * running_mean + factor_new * sample
+            running_var = (1 - factor_new) * running_var + factor_new * (sample - running_mean) ** 2
+            standardized[i] = (sample - running_mean) / (np.sqrt(running_var) + 1e-8)
+        
+        filtered_trial[ch, :] = standardized
+    
+    # 6. 幅值归一化到合理范围
+    trial_std = filtered_trial.std()
+    if trial_std > 0:
+        filtered_trial = filtered_trial / trial_std
+    
+    # 7. 异常值处理
+    filtered_trial = np.clip(filtered_trial, -5, 5)  # 限制在±5标准差内
     
     return filtered_trial
 
@@ -128,7 +203,7 @@ class SIGMA_BCI(torch.nn.Module):
             torch.nn.ReLU(),
             torch.nn.Dropout(0.3),
             torch.nn.Linear(128, 64),
-            torch.nn.ReLU(),
+            torch.nn.ReLU(), 
             torch.nn.Linear(64, 32)
         )
         
@@ -268,11 +343,9 @@ def load_bnci_data_professional():
     all_labels = []
     all_subjects = []
     
-    # 根据环境选择数据路径
-    if '/content' in os.getcwd() or os.path.exists('/content'):
-        data_dir = '/content/BCI/data/bnci/bnci2014_001'
-    else:
-        data_dir = 'data/bnci/bnci2014_001'
+    # 使用全局路径配置
+    data_dir = paths['data_dir']
+    print(f"📂 从 {data_dir} 加载数据...")
     
     # 加载前6个受试者
     for subject_id in range(1, 7):
@@ -282,35 +355,35 @@ def load_bnci_data_professional():
         for session_type in ['0train', '1test']:
             for session_id in range(6):
                 filename = f'S{subject_id:02d}_{session_type}_{session_id}.npz'
-            filepath = os.path.join(data_dir, filename)
-            
+                filepath = os.path.join(data_dir, filename)
+                
                 if os.path.exists(filepath):
-            try:
-                data = np.load(filepath, allow_pickle=True)
+                    try:
+                        data = np.load(filepath, allow_pickle=True)
                         eeg_data = data['data']
                         events = data['events']
                         sfreq = float(data['sfreq'])
-                
-                for event in events:
-                    start_sample = int(event[0])
-                    event_type = int(event[2])
-                    
-                    if event_type in [1, 2, 3, 4]:
-                                end_sample = start_sample + 751
                         
-                        if end_sample <= eeg_data.shape[1]:
-                            trial = eeg_data[:, start_sample:end_sample]
+                        for event in events:
+                            start_sample = int(event[0])
+                            event_type = int(event[2])
                             
+                            if event_type in [1, 2, 3, 4]:
+                                end_sample = start_sample + 751
+                                
+                                if end_sample <= eeg_data.shape[1]:
+                                    trial = eeg_data[:, start_sample:end_sample]
+                                    
                                     # 专业预处理
                                     trial = professional_eeg_preprocessing(trial, sfreq)
-                            
-                            all_trials.append(trial)
-                            all_labels.append(event_type - 1)
-                            all_subjects.append(subject_id)
+                                    
+                                    all_trials.append(trial)
+                                    all_labels.append(event_type - 1)
+                                    all_subjects.append(subject_id)
                                     subject_trials += 1
-                
-            except Exception as e:
-                print(f"    ❌ {filename}: {e}")
+                        
+                    except Exception as e:
+                        print(f"    ❌ {filename}: {e}")
         
         print(f"  受试者{subject_id}: {subject_trials}试次")
     
@@ -322,25 +395,30 @@ trials, labels, subjects = load_bnci_data_professional()
 
 print(f"\n✅ 数据加载完成:")
 print(f"  试次: {len(trials)}")
-print(f"  受试者: {np.unique(subjects)}")
-print(f"  类别分布: {dict(zip(['左手', '右手', '脚', '舌头'], np.bincount(labels)))}")
-print(f"  预处理后数据范围: {trials.min():.2f} ~ {trials.max():.2f}")
+if len(trials) > 0:
+    print(f"  受试者: {np.unique(subjects)}")
+    print(f"  类别分布: {dict(zip(['左手', '右手', '脚', '舌头'], np.bincount(labels.astype(int))))}")
+    print(f"  预处理后数据范围: {trials.min():.2f} ~ {trials.max():.2f}")
+else:
+    print("  ❌ 没有加载到任何数据！")
+    print(f"  请检查数据目录: {paths['data_dir']}")
+    exit(1)
 
 # ===== LOSO分割 =====
 from sklearn.model_selection import train_test_split
 
 test_subject = 1
-    test_mask = subjects == test_subject
+test_mask = subjects == test_subject
 train_mask = ~test_mask
 
 X_train_val = trials[train_mask]
 y_train_val = labels[train_mask]
-    X_test = trials[test_mask]
-    y_test = labels[test_mask]
+X_test = trials[test_mask]
+y_test = labels[test_mask]
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_train_val, y_train_val, test_size=0.2, stratify=y_train_val, random_state=42
-        )
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train_val, y_train_val, test_size=0.2, stratify=y_train_val, random_state=42
+)
 
 # 确保数据类型正确
 X_train = X_train.astype(np.float32)
@@ -393,7 +471,7 @@ for epoch in range(20):
         outputs = model(batch_x)
         loss = criterion(outputs['logits'], batch_y)
         loss.backward()
-            optimizer.step()
+        optimizer.step()
         
         total_loss += loss.item()
         preds = torch.argmax(outputs['logits'], dim=1)
@@ -421,7 +499,8 @@ for epoch in range(20):
     
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(model.state_dict(), 'best_sigma_bci.pth')
+        # 使用配置的保存路径
+        torch.save(model.state_dict(), paths['model_save_path'])
     
     if val_acc > 0.7:
         print("  ✅ 达到70%准确率！")
