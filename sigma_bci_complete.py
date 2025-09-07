@@ -109,62 +109,54 @@ print("✅ 环境准备完成")
 
 # ===== 专业EEG预处理（基于文献最佳实践）=====
 def professional_eeg_preprocessing(trial, sfreq=250.0):
-    """专业EEG预处理：Braindecode + 文献最佳实践"""
+    """
+    专业运动想象EEG预处理管线
+    基于Braindecode、MNE和BCI Competition最佳实践
+    """
     
-    # 1. 带通滤波 (4-40Hz)
+    # 1. 运动想象专用带通滤波 (8-30Hz)
+    # 运动想象主要在μ波(8-14Hz)和β波(14-30Hz)
     nyquist = sfreq / 2
-    low_freq = 4.0 / nyquist
-    high_freq = 40.0 / nyquist
+    low_freq = 8.0 / nyquist   # μ波下限
+    high_freq = 30.0 / nyquist # β波上限
     
-    b, a = signal.butter(4, [low_freq, high_freq], btype='band')
+    # 使用6阶Butterworth滤波器获得更陡的滚降
+    b, a = signal.butter(6, [low_freq, high_freq], btype='band')
     
     filtered_trial = np.zeros_like(trial)
     for ch in range(trial.shape[0]):
         filtered_trial[ch, :] = signal.filtfilt(b, a, trial[ch, :])
     
     # 2. 工频陷波 (50Hz及谐波)
-    for notch_freq in [50.0, 100.0]:  # 50Hz和100Hz
+    for notch_freq in [50.0]:  # 只处理50Hz，100Hz通常在滤波范围外
         if notch_freq < sfreq / 2:
             notch_normalized = notch_freq / nyquist
-            b_notch, a_notch = signal.iirnotch(notch_normalized, Q=30)
+            b_notch, a_notch = signal.iirnotch(notch_normalized, Q=35)  # 更高Q值，更窄陷波
             
             for ch in range(filtered_trial.shape[0]):
                 filtered_trial[ch, :] = signal.filtfilt(b_notch, a_notch, filtered_trial[ch, :])
     
-    # 3. 基线校正
+    # 3. 通道重参考 (CAR) - 在基线校正前进行
+    car = filtered_trial.mean(axis=0, keepdims=True)
+    filtered_trial = filtered_trial - car
+    
+    # 4. 基线校正 (使用前0.5秒作为基线)
     baseline_samples = int(0.5 * sfreq)
     if trial.shape[1] > baseline_samples:
         baseline = filtered_trial[:, :baseline_samples].mean(axis=1, keepdims=True)
         filtered_trial = filtered_trial - baseline
     
-    # 4. 通道重参考 (CAR)
-    car = filtered_trial.mean(axis=0, keepdims=True)
-    filtered_trial = filtered_trial - car
-    
-    # 5. 指数移动标准化 (Braindecode标准)
-    factor_new = 1e-3
+    # 5. 简单但有效的标准化 (避免过度处理)
+    # 使用试次级别的Z-score标准化
     for ch in range(filtered_trial.shape[0]):
         ch_data = filtered_trial[ch, :]
-        
-        # 指数移动均值和方差
-        running_mean = 0
-        running_var = 1
-        
-        standardized = np.zeros_like(ch_data)
-        for i, sample in enumerate(ch_data):
-            running_mean = (1 - factor_new) * running_mean + factor_new * sample
-            running_var = (1 - factor_new) * running_var + factor_new * (sample - running_mean) ** 2
-            standardized[i] = (sample - running_mean) / (np.sqrt(running_var) + 1e-8)
-        
-        filtered_trial[ch, :] = standardized
+        ch_mean = ch_data.mean()
+        ch_std = ch_data.std()
+        if ch_std > 1e-8:
+            filtered_trial[ch, :] = (ch_data - ch_mean) / ch_std
     
-    # 6. 幅值归一化到合理范围
-    trial_std = filtered_trial.std()
-    if trial_std > 0:
-        filtered_trial = filtered_trial / trial_std
-    
-    # 7. 异常值处理
-    filtered_trial = np.clip(filtered_trial, -5, 5)  # 限制在±5标准差内
+    # 6. 温和的异常值处理
+    filtered_trial = np.clip(filtered_trial, -6, 6)  # 限制在±6标准差内
     
     return filtered_trial
 
@@ -449,15 +441,34 @@ test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 # 模型
 model = SIGMA_BCI(n_classes=4, n_chans=22, samples=751).to(device)
 
-# 优化器配置
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=0.01)
+# 优化器配置 - EEGNet标准参数
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
 criterion = torch.nn.CrossEntropyLoss()
+
+# 权重初始化
+def init_weights(m):
+    if isinstance(m, torch.nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight, gain=1.0)
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+    elif isinstance(m, torch.nn.Conv1d):
+        torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+    elif isinstance(m, torch.nn.Conv2d):
+        torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+model.apply(init_weights)
+print("✅ 模型权重重新初始化")
+
+# 学习率调度器
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6, verbose=True
+)
 
 # 训练
 print(f"\n🚀 完整SIGMA-BCI训练...")
 
 best_val_acc = 0
-for epoch in range(20):
+for epoch in range(30):  # 增加训练轮数
     # 训练
     model.train()
     total_loss = 0
@@ -497,13 +508,27 @@ for epoch in range(20):
     
     print(f"  Epoch {epoch+1}: Loss={avg_loss:.4f}, Train={train_acc:.4f}, Val={val_acc:.4f}")
     
+    # 学习率调度
+    old_lr = optimizer.param_groups[0]['lr']
+    scheduler.step(val_acc)
+    new_lr = optimizer.param_groups[0]['lr']
+    if new_lr != old_lr:
+        print(f"    📉 学习率调整: {old_lr:.2e} → {new_lr:.2e}")
+    
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         # 使用配置的保存路径
         torch.save(model.state_dict(), paths['model_save_path'])
+        print(f"    💾 保存最佳模型 (Val Acc: {val_acc:.4f})")
     
-    if val_acc > 0.7:
-        print("  ✅ 达到70%准确率！")
+    # 早期停止条件
+    if val_acc > 0.6:
+        print("  ✅ 达到60%准确率！")
+        break
+    
+    # 检查是否学习停滞
+    if epoch > 10 and val_acc <= 0.3:
+        print("  ⚠️  学习停滞，可能需要调整超参数")
         break
 
 # ===== 最终测试 =====
