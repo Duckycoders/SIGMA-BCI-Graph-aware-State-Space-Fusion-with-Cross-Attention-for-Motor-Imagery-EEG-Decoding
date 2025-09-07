@@ -40,7 +40,7 @@ else:
     print("📁 首次运行，无需清理")
 
 # ===== 2. 安装依赖 =====
-os.system('pip install pyyaml matplotlib seaborn tqdm scikit-learn')
+os.system('pip install pyyaml matplotlib seaborn tqdm scikit-learn scipy')
 
 # ===== 3. 重建项目结构 =====
 os.makedirs('/content/BCI', exist_ok=True)
@@ -95,7 +95,80 @@ def create_electrode_graph(electrode_names, graph_type='standard'):
 
 print("✅ 环境准备完成")
 
-# ===== 4. 数据状态检查 =====
+# ===== 4. 专业EEG预处理管道（基于Braindecode和文献最佳实践）=====
+def professional_eeg_preprocessing(trial, sfreq=250.0):
+    """
+    专业EEG预处理管道，基于Braindecode和BCI文献最佳实践
+    
+    Args:
+        trial: EEG试次数据 (n_channels, n_samples)
+        sfreq: 采样频率
+    
+    Returns:
+        预处理后的试次数据
+    """
+    from scipy import signal
+    
+    # 1. 带通滤波 (4-40Hz) - BCI标准频带
+    nyquist = sfreq / 2
+    low_freq = 4.0 / nyquist   # 去除低频漂移
+    high_freq = 40.0 / nyquist # 保留主要的μ和β波
+    
+    # 使用4阶Butterworth滤波器
+    b, a = signal.butter(4, [low_freq, high_freq], btype='band')
+    
+    filtered_trial = np.zeros_like(trial)
+    for ch in range(trial.shape[0]):
+        # 使用filtfilt进行零相位滤波
+        filtered_trial[ch, :] = signal.filtfilt(b, a, trial[ch, :])
+    
+    # 2. 工频陷波 (50Hz及谐波)
+    for notch_freq in [50.0, 100.0]:  # 50Hz和100Hz
+        if notch_freq < sfreq / 2:
+            notch_normalized = notch_freq / nyquist
+            b_notch, a_notch = signal.iirnotch(notch_normalized, Q=30)
+            
+            for ch in range(filtered_trial.shape[0]):
+                filtered_trial[ch, :] = signal.filtfilt(b_notch, a_notch, filtered_trial[ch, :])
+    
+    # 3. 基线校正 (前500ms作为基线)
+    baseline_samples = int(0.5 * sfreq)  # 500ms
+    if trial.shape[1] > baseline_samples:
+        baseline = filtered_trial[:, :baseline_samples].mean(axis=1, keepdims=True)
+        filtered_trial = filtered_trial - baseline
+    
+    # 4. 通道重参考 (CAR - Common Average Reference)
+    car = filtered_trial.mean(axis=0, keepdims=True)
+    filtered_trial = filtered_trial - car
+    
+    # 5. 指数移动标准化 (Braindecode标准)
+    factor_new = 1e-3
+    for ch in range(filtered_trial.shape[0]):
+        ch_data = filtered_trial[ch, :]
+        
+        # 指数移动均值和方差
+        running_mean = 0
+        running_var = 1
+        
+        standardized = np.zeros_like(ch_data)
+        for i, sample in enumerate(ch_data):
+            running_mean = (1 - factor_new) * running_mean + factor_new * sample
+            running_var = (1 - factor_new) * running_var + factor_new * (sample - running_mean) ** 2
+            standardized[i] = (sample - running_mean) / (np.sqrt(running_var) + 1e-8)
+        
+        filtered_trial[ch, :] = standardized
+    
+    # 6. 幅值归一化到合理范围
+    trial_std = filtered_trial.std()
+    if trial_std > 0:
+        filtered_trial = filtered_trial / trial_std
+    
+    # 7. 异常值处理
+    filtered_trial = np.clip(filtered_trial, -5, 5)  # 限制在±5标准差内
+    
+    return filtered_trial
+
+# ===== 5. 数据状态检查 =====
 print("\n🔍 检查手动上传的数据...")
 
 data_dir = '/content/BCI/data/bnci/bnci2014_001'
@@ -273,98 +346,136 @@ print(f"  验证: {len(X_val)}")
 print(f"  测试: {len(X_test)}")
 
 # ===== 7. SIGMA-BCI模型 =====
-class RealDataSigmaBCI(torch.nn.Module):
-    """基于真实BNCI数据的SIGMA-BCI（改进版）"""
+class EEGNet_SIGMA_BCI(torch.nn.Module):
+    """基于EEGNet的SIGMA-BCI：融合经典架构与创新组件"""
     
-    def __init__(self):
+    def __init__(self, n_classes=4, n_chans=22, samples=751, dropout=0.5):
         super().__init__()
         
-        # 1. 改进FilterBank（更多频带）
-        self.mu_filter = torch.nn.Conv1d(22, 22, 25, padding=12, groups=22)     # μ波 8-12Hz
-        self.beta_filter = torch.nn.Conv1d(22, 22, 15, padding=7, groups=22)    # β波 15-30Hz
-        self.gamma_filter = torch.nn.Conv1d(22, 22, 7, padding=3, groups=22)    # γ波 30-45Hz
-        
-        # 2. 简化S4分支（减少复杂性，提升学习能力）
-        self.s4_branch = torch.nn.Sequential(
-            torch.nn.Linear(1, 64),
-            torch.nn.LayerNorm(64),
-            torch.nn.GELU(),
-            torch.nn.Linear(64, 64)
+        # ===== EEGNet主干（经过验证的架构）=====
+        # Block 1: 时间卷积
+        self.firstconv = torch.nn.Sequential(
+            torch.nn.Conv2d(1, 16, (1, 64), padding=(0, 32), bias=False),
+            torch.nn.BatchNorm2d(16),
         )
         
-        # 3. 简化Mamba分支
-        self.mamba_branch = torch.nn.Sequential(
-            torch.nn.Linear(1, 64),
-            torch.nn.LayerNorm(64),
-            torch.nn.SiLU(),
-            torch.nn.Linear(64, 64)
+        # Block 2: 深度卷积（空间滤波）
+        self.depthwiseConv = torch.nn.Sequential(
+            torch.nn.Conv2d(16, 32, (n_chans, 1), groups=16, bias=False),
+            torch.nn.BatchNorm2d(32),
+            torch.nn.ELU(),
+            torch.nn.AvgPool2d((1, 4)),
+            torch.nn.Dropout(dropout)
         )
         
-        # 4. 改进跨注意力融合
-        self.cross_attention = torch.nn.MultiheadAttention(64, 8, batch_first=True)
-        self.fusion_norm = torch.nn.LayerNorm(64)
+        # Block 3: 可分离卷积
+        self.separableConv = torch.nn.Sequential(
+            torch.nn.Conv2d(32, 32, (1, 16), padding=(0, 8), bias=False),
+            torch.nn.BatchNorm2d(32),
+            torch.nn.ELU(),
+            torch.nn.AvgPool2d((1, 8)),
+            torch.nn.Dropout(dropout)
+        )
         
-        # 5. 增强Riemann分支
+        # ===== SIGMA-BCI创新组件 =====
+        # 1. Riemann几何分支
         self.riemann_branch = torch.nn.Sequential(
-            torch.nn.Linear(253, 128),
+            torch.nn.Linear(253, 128),  # 22*23/2 = 253
             torch.nn.ReLU(),
-            torch.nn.Dropout(0.1),
+            torch.nn.Dropout(0.3),
             torch.nn.Linear(128, 64),
             torch.nn.ReLU(),
-            torch.nn.Dropout(0.1),
             torch.nn.Linear(64, 32)
         )
         
-        # 6. 简化MoE（4个轻量专家）
-        self.expert_spatial = torch.nn.Sequential(
-            torch.nn.Linear(64, 64),
-            torch.nn.GELU(),
-            torch.nn.Linear(64, 64)
-        )
-        self.expert_temporal = torch.nn.Sequential(
-            torch.nn.Linear(64, 64),
-            torch.nn.Tanh(),
-            torch.nn.Linear(64, 64)
-        )
-        self.expert_frequency = torch.nn.Sequential(
-            torch.nn.Linear(64, 64),
+        # 2. 简化MoE（2个专家，避免过复杂）
+        self.expert1 = torch.nn.Linear(64, 64)  # 空间专家
+        self.expert2 = torch.nn.Linear(64, 64)  # 时间专家
+        self.router = torch.nn.Linear(64, 2)
+        
+        # 计算EEGNet特征维度
+        self.feature_size = self._get_feature_size(n_chans, samples)
+        
+        # ===== 多模态融合分类器 =====
+        self.multimodal_classifier = torch.nn.Sequential(
+            torch.nn.Linear(self.feature_size + 32, 128),  # EEGNet特征 + Riemann特征
             torch.nn.ReLU(),
-            torch.nn.Linear(64, 64)
-        )
-        self.expert_mixed = torch.nn.Sequential(
-            torch.nn.Linear(64, 64),
-            torch.nn.SiLU(),
-            torch.nn.Linear(64, 64)
-        )
-        
-        self.router = torch.nn.Sequential(
-            torch.nn.Linear(64, 32),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(128, 64),
             torch.nn.ReLU(),
-            torch.nn.Linear(32, 4)  # 4专家路由
+            torch.nn.Dropout(0.3),
+            torch.nn.Linear(64, n_classes)
         )
         
-        # 7. 增强多模态融合
-        self.multimodal = torch.nn.Sequential(
-            torch.nn.Linear(64 + 32, 64),  # 深度特征 + Riemann特征
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(64, 64)
-        )
-        
-        # 8. 改进分类头
-        self.classifier = torch.nn.Sequential(
-            torch.nn.Linear(64, 32),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(32, 4)
-        )
-        
-        print("优化SIGMA-BCI: 简化架构，强制学习能力")
-        
-        # 重要：初始化分类器偏置，打破对称性
+        print(f"EEGNet-SIGMA: 经典EEGNet + Riemann几何 + 轻量MoE")
+        print(f"  EEGNet特征维度: {self.feature_size}")
+    
+    def _get_feature_size(self, n_chans, samples):
+        """计算EEGNet输出特征维度"""
         with torch.no_grad():
-            # 给每个类别不同的初始偏置
-            self.classifier[-1].bias.copy_(torch.tensor([-0.1, 0.1, -0.05, 0.05]))
+            x = torch.randn(1, 1, n_chans, samples)
+            x = self.firstconv(x)
+            x = self.depthwiseConv(x)
+            x = self.separableConv(x)
+            return x.view(1, -1).shape[1]
+    
+    def compute_riemann_features(self, x):
+        """计算Riemann几何特征"""
+        # x: (batch, channels, time)
+        batch_size, n_channels, n_time = x.shape
+        
+        # 计算协方差矩阵
+        x_centered = x - x.mean(dim=-1, keepdim=True)
+        cov_matrices = torch.bmm(x_centered, x_centered.transpose(-1, -2)) / (n_time - 1)
+        
+        # 正则化
+        eye = torch.eye(n_channels, device=x.device)
+        cov_matrices = cov_matrices + 1e-6 * eye.unsqueeze(0)
+        
+        # 向量化上三角
+        triu_indices = torch.triu_indices(n_channels, n_channels)
+        cov_vectors = cov_matrices[:, triu_indices[0], triu_indices[1]]
+        
+        return cov_vectors
+    
+    def forward(self, x):
+        batch_size = x.shape[0]
+        
+        # ===== EEGNet主路径 =====
+        x_eeg = x.unsqueeze(1)  # (batch, 1, channels, time)
+        
+        # EEGNet前向传播
+        x_eeg = self.firstconv(x_eeg)
+        x_eeg = self.depthwiseConv(x_eeg)
+        x_eeg = self.separableConv(x_eeg)
+        
+        # 展平EEGNet特征
+        eegnet_features = x_eeg.view(batch_size, -1)
+        
+        # ===== SIGMA创新路径 =====
+        # 1. Riemann几何特征
+        riemann_features = self.riemann_branch(self.compute_riemann_features(x))
+        
+        # 2. 轻量MoE处理EEGNet特征
+        router_weights = torch.softmax(self.router(eegnet_features), dim=-1)
+        expert1_out = self.expert1(eegnet_features)
+        expert2_out = self.expert2(eegnet_features)
+        moe_features = router_weights[:, 0:1] * expert1_out + router_weights[:, 1:2] * expert2_out
+        
+        # ===== 多模态融合 =====
+        # 融合EEGNet特征和Riemann特征
+        combined_features = torch.cat([moe_features, riemann_features], dim=-1)
+        
+        # 最终分类
+        logits = self.multimodal_classifier(combined_features)
+        
+        return {
+            'logits': logits,
+            'predictions': torch.softmax(logits, dim=-1),
+            'eegnet_features': eegnet_features,
+            'riemann_features': riemann_features,
+            'moe_weights': router_weights
+        }
     
     def compute_riemann(self, x):
         batch_size, n_channels, n_time = x.shape
@@ -505,9 +616,8 @@ def load_bnci_data_robust(data_dir, max_subjects=6):
                         if end_sample <= eeg_data.shape[1]:
                             trial = eeg_data[:, start_sample:end_sample]
                             
-                            # 重要：数据标准化
-                            trial = trial - trial.mean(axis=1, keepdims=True)  # 去均值
-                            trial = trial / (trial.std(axis=1, keepdims=True) + 1e-8)  # 标准化
+                            # 专业EEG预处理管道（基于Braindecode）
+                            trial = professional_eeg_preprocessing(trial, sfreq=float(data['sfreq']))
                             
                             all_trials.append(trial)
                             all_labels.append(event_type - 1)
@@ -648,20 +758,18 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-# 创建模型
-model = RealDataSigmaBCI()
+# 创建EEGNet-SIGMA模型
+model = EEGNet_SIGMA_BCI(n_classes=4, n_chans=22, samples=751, dropout=0.5)
 model = model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=1e-6)  # 更高学习率
-criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.0)  # 无标签平滑
+# EEGNet标准训练配置
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=0.01)  # EEGNet经典配置
+criterion = torch.nn.CrossEntropyLoss()
 
-# 添加学习率调度器
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)  # 更简单的调度器
-
-# 添加类别权重平衡（重要！）
-class_counts = np.bincount(y_train)
-class_weights = torch.FloatTensor(len(class_counts) / class_counts).to(device)
-criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+# 学习率调度（EEGNet风格）
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6
+)
 
 print(f"📊 优化模型参数: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -734,9 +842,9 @@ for epoch in range(8):  # 增加训练轮数
     
     print(f"  Epoch {epoch+1}: Loss={avg_loss:.4f}, Train={train_acc:.4f}, Val={val_acc:.4f}")
     
-    # 学习率调度（每个epoch都调度）
+    # 学习率调度（基于验证性能）
     old_lr = optimizer.param_groups[0]['lr']
-    scheduler.step()
+    scheduler.step(val_acc)
     new_lr = optimizer.param_groups[0]['lr']
     if new_lr != old_lr:
         print(f"    📉 学习率调整: {old_lr:.2e} → {new_lr:.2e}")
